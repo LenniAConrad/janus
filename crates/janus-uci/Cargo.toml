@@ -1,0 +1,26 @@
+[package]
+name = "janus-uci"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Bounded asynchronous UCI executable for the Janus chess engine"
+
+[[bin]]
+name = "janus"
+path = "src/main.rs"
+
+[dependencies]
+janus-core = { path = "../janus-core" }
+janus-engine = { path = "../janus-engine", default-features = false }
+
+[features]
+default = ["gpu", "mcts"]
+# Forwards the BT4 OpenCL helper-process client in janus-engine.
+gpu = ["janus-engine/gpu"]
+# PUCT Monte Carlo tree search behind the UCI `Search` combo option.
+mcts = ["janus-engine/mcts"]
+
+[lints]
+workspace = true

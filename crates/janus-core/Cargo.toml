@@ -1,0 +1,16 @@
+[package]
+name = "janus-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Dependency-free chess rules and move-generation core for Janus"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+
+[lints]
+workspace = true
