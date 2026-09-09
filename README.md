@@ -15,8 +15,8 @@ dated; the UCI handshake reports the date while Cargo carries its derived
 
 ## Learn
 
-The companion book, [Build a Chess Engine](https://github.com/LenniAConrad/build-a-chess-engine),
-is maintained as a separate public repository.
+Read the companion book, [Build a Chess Engine](https://lenniaconrad.github.io/build-a-chess-engine/),
+online.
 
 ## Reproducibility and platform floor
 
