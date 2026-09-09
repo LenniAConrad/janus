@@ -561,4 +561,3 @@ fn is_go_keyword(token: &str) -> bool {
             | "infinite"
     )
 }
-

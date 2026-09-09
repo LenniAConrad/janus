@@ -2859,4 +2859,3 @@ const fn see_piece_value(kind: PieceKind) -> i32 {
         _ => piece_value(kind),
     }
 }
-

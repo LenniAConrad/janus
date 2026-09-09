@@ -1425,4 +1425,3 @@ const fn build_compressed_by_internal() -> [i16; INTERNAL_POLICY_SIZE] {
 /// [`build_compressed_by_internal`] and exposed through
 /// [`compressed_by_internal_map`].
 const COMPRESSED_BY_INTERNAL: [i16; INTERNAL_POLICY_SIZE] = build_compressed_by_internal();
-

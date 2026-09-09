@@ -1375,15 +1375,15 @@ impl Bt4Network {
 
 /// Used for bounding the absolute policy difference accepted across scalar
 /// CPU and `OpenCL` arithmetic.
-#[cfg(any(test, feature = "gpu"))]
+#[cfg(feature = "gpu")]
 const GPU_POLICY_ABSOLUTE_TOLERANCE: f32 = 2.0e-2;
 /// Used for bounding the magnitude-scaled policy difference accepted in
 /// addition to the absolute term.
-#[cfg(any(test, feature = "gpu"))]
+#[cfg(feature = "gpu")]
 const GPU_POLICY_RELATIVE_TOLERANCE: f32 = 5.0e-3;
 /// Used for bounding the absolute WDL probability difference accepted during
 /// GPU admission.
-#[cfg(any(test, feature = "gpu"))]
+#[cfg(feature = "gpu")]
 const GPU_WDL_ABSOLUTE_TOLERANCE: f32 = 2.0e-3;
 
 /// Used for validating one complete CPU/GPU admission pair without hiding a
@@ -1401,7 +1401,7 @@ const GPU_WDL_ABSOLUTE_TOLERANCE: f32 = 2.0e-3;
 /// Returns [`Bt4Error`] with [`Bt4ErrorKind::Backend`] for a wrong-sized
 /// policy, a non-finite value, or any element outside the declared
 /// tolerances.
-#[cfg(any(test, feature = "gpu"))]
+#[cfg(feature = "gpu")]
 fn validate_gpu_admission(
     baseline_policy: &[f32],
     candidate_policy: &[f32],
@@ -2570,4 +2570,3 @@ fn is_queen_like_or_knight(from: usize, to: usize) -> bool {
         || file_delta.abs() == rank_delta.abs()
         || KNIGHT_DELTAS.contains(&(file_delta, rank_delta))
 }
-

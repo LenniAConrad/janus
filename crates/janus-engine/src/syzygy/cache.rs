@@ -91,8 +91,6 @@ impl BlockCache {
         }
     }
 
-
-
     /// Used for fetching a block, loading and caching it on a miss.
     ///
     /// A hit moves the block to the most recently used position. On a miss

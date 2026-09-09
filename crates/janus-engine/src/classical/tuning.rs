@@ -18,29 +18,24 @@
 //!    phase)) / MAX_PHASE)` plus a position constant holding the frozen
 //!    non-linear terms.
 //!
-//! Deliberately excluded from the parameter vector (stage 1 of the 2026-07-24
-//! blueprint): `TEMPO`, `SEARCH_SCORE_SCALE_PERCENT`, `MAX_PHASE` and the
-//! phase weights, king sentinels, the dead compact flavor, the quiet-move
-//! ordering prior, and the non-linear interiors (the passed-pawn squared-
-//! advance reward,
-//! bad-bishop products, king-pressure `flank^2`/`attackers^2` quadratics, the
-//! queen-absent percentage, and the single-attacker halving).
+//! Public implementation detail retained for the released engine.
 
 use super::{
     activity_term, bad_bishop_penalty, bit_count, board_square, camp_mask, can_castle_either,
     center_squares, color_sign, diagonal_attacks, file_mask, game_phase, is_castled_king_square,
     is_outpost, is_passed, king_distance, king_flank_mask, king_ring, knight_attacks,
-    mobility_term, orthogonal_attacks, outpost_mask, pawn_attack_mask, pawn_push_mask, rank_mask,
-    relative_rank, same_flank, shelter_file_count, square_offset, tapered_score, AttackMaps,
-    ClassicalBreakdown, KING_ATTACKERS_SQUARED, MAX_PHASE, PASSED_PAWN_QUADRATIC, TEMPO,
+    mobility_term, orthogonal_attacks, outpost_mask, passed_file_masks, pawn_attack_mask,
+    pawn_push_mask, rank_mask, relative_rank, same_flank, shelter_file_count, square_offset,
+    tapered_score, AttackMaps, ClassicalBreakdown, KING_ATTACKERS_SQUARED, MAX_PHASE,
+    PASSED_PAWN_QUADRATIC, TEMPO,
 };
 use janus_core::{Color, Piece, PieceKind, Position, Square};
 
 /// Used for sizing the flattened linear parameter vector.
 ///
 /// The layout is frozen by [`ClassicalParams::to_flat`] and documented by
-/// [`descriptors`]; every consumer indexes the same 223 slots.
-pub const PARAM_COUNT: usize = 223;
+/// [`descriptors`]; every consumer indexes the same 227 slots.
+pub const PARAM_COUNT: usize = 611;
 
 /// Used for bounding the integer-rounding residue between the released
 /// integer evaluation and the smooth linear model at the default parameters.
@@ -135,6 +130,31 @@ pub struct ClassicalParams {
     /// Used for the flat passed-pawn base bonus (`8`); the quadratic
     /// `5 * advance^2` interior stays constant in stage 1.
     pub passed_pawn_base: i32,
+    /// Used for weighting each advanced passer's own king distance to its
+    /// front square, multiplied by `urgency` (`0` — no released term).
+    ///
+    /// Alternative configuration retained for controlled evaluation.
+    ///
+    /// Every weight in this group defaults to zero, which makes the
+    /// parameterized evaluator an **exact** reproduction of the release until
+    /// a fit earns them.
+    pub passed_own_king_distance: i32,
+    /// Used for weighting each advanced passer's enemy king distance to its
+    /// front square, multiplied by `urgency` (`0` — no released term).
+    pub passed_enemy_king_distance: i32,
+    /// Used for weighting an advanced passer whose first rearward file
+    /// blocker is a friendly rook, by `urgency^2` (`0` — no released term).
+    pub passed_rook_behind: i32,
+    /// Used for weighting an advanced passer's distance from the central
+    /// files, by `urgency^2` (`0` — no released term).
+    pub passed_outside_file: i32,
+    /// Alternative configuration retained for controlled evaluation.
+    ///
+    /// Indexed by piece kind, folded colour-relative square, then `[mg, eg]`.
+    /// Zero at the released defaults, which makes the released formula the
+    /// exact origin of the fit, and folds into the compile-time placement
+    /// table on promotion so per-square resolution costs nothing per node.
+    pub piece_square_delta: [[[i32; 2]; 32]; 6],
     /// Used for the bishop-pair bonus (`39`).
     pub bishop_pair: i32,
     /// Used for the rook-on-open-file bonus (`20`).
@@ -276,99 +296,115 @@ impl Default for ClassicalParams {
     /// # Returns
     ///
     /// Parameters equal to the frozen release values in the parent module.
+    // A flat literal of every released weight. The lint targets branching
+    // complexity, and this has none; splitting it would need a second
+    // constructor to serve as a struct-update base, which is strictly more
+    // code and one more place for a weight to go stale.
+    #[allow(clippy::too_many_lines)]
     fn default() -> Self {
         Self {
-            material: [98, 357, 382, 585, 1211],
+            material: [99, 359, 388, 608, 1221],
             pawn_advance_mg: 4,
-            pawn_center_mg: -3,
+            pawn_center_mg: -2,
             pawn_advance_eg: 10,
-            pawn_center_eg: -3,
+            pawn_center_eg: -2,
             knight_center_mg: 5,
             knight_center_eg: 3,
             knight_edge_penalty_mg: 10,
             knight_corner_penalty_mg: 24,
             bishop_center_mg: 4,
-            bishop_advance_mg: 1,
+            bishop_advance_mg: -1,
             bishop_center_eg: 2,
-            rook_advance_mg: 3,
-            rook_center_eg: 0,
+            rook_advance_mg: 2,
+            rook_center_eg: 1,
             rook_advance_eg: 2,
             queen_center_mg: 5,
             queen_center_eg: 3,
             king_center_mg: 8,
-            king_advance_mg: 2,
-            king_center_eg: 5,
-            king_advance_eg: 2,
-            knight_mobility_mg: super::KNIGHT_MOBILITY_MG,
-            knight_mobility_eg: super::KNIGHT_MOBILITY_EG,
-            bishop_mobility_mg: super::BISHOP_MOBILITY_MG,
-            bishop_mobility_eg: super::BISHOP_MOBILITY_EG,
-            rook_mobility_mg: super::ROOK_MOBILITY_MG,
-            rook_mobility_eg: super::ROOK_MOBILITY_EG,
-            queen_mobility_mg: super::QUEEN_MOBILITY_MG,
-            queen_mobility_eg: super::QUEEN_MOBILITY_EG,
-            doubled_pawn_penalty: 13,
+            king_advance_mg: 1,
+            king_center_eg: 7,
+            king_advance_eg: 3,
+            knight_mobility_mg: [-16, -10, 1, 4, 8, 13, 10, 13, 14],
+            knight_mobility_eg: [-23, -18, -7, -2, 6, 10, 18, 9, 9],
+            bishop_mobility_mg: [-17, -4, 1, 12, 12, 11, 16, 21, 23, 28, 31, 33, 35, 34],
+            bishop_mobility_eg: [-18, -10, 0, 6, 12, 22, 25, 28, 37, 39, 39, 39, 42, 40],
+            rook_mobility_mg: [-15, -8, -2, 2, 6, 9, 13, 14, 19, 19, 25, 27, 29, 32, 31],
+            rook_mobility_eg: [-23, -9, -4, 7, 14, 26, 28, 41, 44, 49, 47, 53, 59, 57, 49],
+            queen_mobility_mg: [
+                -9, -3, 0, -1, 4, 4, 9, 8, 14, 14, 18, 22, 20, 24, 24, 23, 24, 24, 25, 27, 27, 29,
+                29, 28, 30, 30, 33, 33,
+            ],
+            queen_mobility_eg: [
+                -13, -8, -4, 1, 5, 10, 14, 17, 22, 26, 29, 35, 42, 40, 44, 49, 50, 52, 56, 56, 61,
+                62, 64, 68, 64, 67, 74, 75,
+            ],
+            doubled_pawn_penalty: 12,
             isolated_pawn_penalty: 12,
-            passed_pawn_base: 8,
-            bishop_pair: 39,
-            rook_open_file: 20,
-            rook_semi_open_file: 10,
-            king_castled_mg: 28,
-            king_shelter_mg: 9,
-            king_attack_weight: [-2, 10, 8, 12, 19],
-            king_ring_attack: 15,
-            king_weak_square: 9,
-            king_flank_defense: 5,
-            king_pawnless_flank: 18,
+            passed_pawn_base: 6,
+            passed_own_king_distance: -2,
+            passed_enemy_king_distance: 2,
+            passed_rook_behind: 0,
+            passed_outside_file: 1,
+            piece_square_delta: super::PLACEMENT_DELTA,
+            bishop_pair: 41,
+            rook_open_file: 22,
+            rook_semi_open_file: 11,
+            king_castled_mg: 29,
+            king_shelter_mg: 10,
+            king_attack_weight: [-1, 11, 6, 12, 20],
+            king_ring_attack: 12,
+            king_weak_square: 7,
+            king_flank_defense: 7,
+            king_pawnless_flank: 19,
             king_check_penalty: 35,
-            knight_outpost_mg: 27,
-            knight_outpost_eg: 14,
+            knight_outpost_mg: 28,
+            knight_outpost_eg: 13,
             bishop_outpost_mg: 15,
             bishop_outpost_eg: 8,
             knight_reachable_outpost_mg: 13,
-            knight_reachable_outpost_eg: 6,
-            bishop_reachable_outpost_mg: 7,
+            knight_reachable_outpost_eg: 7,
+            bishop_reachable_outpost_mg: 9,
             bishop_reachable_outpost_eg: 3,
-            minor_behind_pawn_mg: 8,
+            minor_behind_pawn_mg: 7,
             minor_behind_pawn_eg: 5,
             knight_king_distance_mg: 2,
             bishop_king_distance_mg: 2,
-            bishop_long_diagonal_mg: 8,
+            bishop_long_diagonal_mg: 10,
             bishop_long_diagonal_eg: 4,
-            rook_queen_file_mg: 6,
-            rook_seventh_mg: 18,
-            rook_seventh_eg: 27,
+            rook_queen_file_mg: 5,
+            rook_seventh_mg: 19,
+            rook_seventh_eg: 26,
             trapped_rook_castle: 10,
             trapped_rook_no_castle: 16,
             queen_advanced_mg: 7,
-            queen_advanced_eg: 10,
-            hanging_threat_mg: 21,
+            queen_advanced_eg: 11,
+            hanging_threat_mg: 22,
             hanging_threat_eg: 25,
-            restricted_threat_mg: 4,
-            safe_pawn_threat_mg: 43,
+            restricted_threat_mg: 5,
+            safe_pawn_threat_mg: 45,
             safe_pawn_threat_eg: 30,
             pawn_push_threat_mg: 13,
-            pawn_push_threat_eg: 8,
-            queen_knight_threat_mg: 7,
-            queen_knight_threat_eg: 7,
-            queen_slider_threat_mg: 15,
-            queen_slider_threat_eg: 4,
-            minor_threat_pawn_mg: 6,
-            minor_threat_pawn_eg: 15,
-            minor_threat_minor_mg: 32,
-            minor_threat_minor_eg: 25,
-            minor_threat_rook_mg: 48,
+            pawn_push_threat_eg: 7,
+            queen_knight_threat_mg: 6,
+            queen_knight_threat_eg: 6,
+            queen_slider_threat_mg: 17,
+            queen_slider_threat_eg: 5,
+            minor_threat_pawn_mg: 7,
+            minor_threat_pawn_eg: 13,
+            minor_threat_minor_mg: 33,
+            minor_threat_minor_eg: 24,
+            minor_threat_rook_mg: 49,
             minor_threat_rook_eg: 37,
             minor_threat_queen_mg: 57,
-            minor_threat_queen_eg: 70,
-            rook_threat_pawn_mg: 4,
-            rook_threat_pawn_eg: 28,
-            rook_threat_minor_mg: 24,
-            rook_threat_minor_eg: 36,
-            rook_threat_rook_mg: 0,
-            rook_threat_rook_eg: 18,
-            rook_threat_queen_mg: 41,
-            rook_threat_queen_eg: 36,
+            minor_threat_queen_eg: 76,
+            rook_threat_pawn_mg: 2,
+            rook_threat_pawn_eg: 27,
+            rook_threat_minor_mg: 25,
+            rook_threat_minor_eg: 37,
+            rook_threat_rook_mg: 1,
+            rook_threat_rook_eg: 19,
+            rook_threat_queen_mg: 40,
+            rook_threat_queen_eg: 34,
         }
     }
 }
@@ -476,6 +512,12 @@ impl ClassicalParams {
         slots.push(&mut self.rook_threat_rook_eg);
         slots.push(&mut self.rook_threat_queen_mg);
         slots.push(&mut self.rook_threat_queen_eg);
+        // Historical calibration detail omitted from the public source release.
+        slots.push(&mut self.passed_own_king_distance);
+        slots.push(&mut self.passed_enemy_king_distance);
+        slots.push(&mut self.passed_rook_behind);
+        slots.push(&mut self.passed_outside_file);
+        extend_with_placement_delta(&mut slots, &mut self.piece_square_delta);
         slots
     }
 
@@ -552,7 +594,13 @@ pub struct ParamDescriptor {
 #[allow(clippy::too_many_lines)]
 pub fn descriptors() -> Vec<ParamDescriptor> {
     let mut list: Vec<ParamDescriptor> = Vec::with_capacity(PARAM_COUNT);
-    let mut push = |name: String, site: &str, default: i32| {
+    // The `default` argument each call site passes is documentation of what
+    // the value was when the descriptor was written; the authoritative value
+    // is `RELEASED_FLAT`, read by position so a promotion cannot leave the two
+    // disagreeing.
+    let released = ClassicalParams::default().to_flat();
+    let mut push = |name: String, site: &str, _documented: i32| {
+        let default = released[list.len()];
         list.push(ParamDescriptor {
             name,
             site: site.to_owned(),
@@ -570,9 +618,9 @@ pub fn descriptors() -> Vec<ParamDescriptor> {
     push("pawn_advance_mg".into(), placement, 4);
     push("pawn_center_mg".into(), placement, -3);
     push("pawn_advance_eg".into(), placement, 10);
-    push("pawn_center_eg".into(), placement, -3);
+    push("pawn_center_eg".into(), placement, -2);
     push("knight_center_mg".into(), placement, 5);
-    push("knight_center_eg".into(), placement, 3);
+    push("knight_center_eg".into(), placement, 2);
     push(
         "knight_edge_penalty_mg".into(),
         "fn edge_penalty single-edge literal",
@@ -584,17 +632,17 @@ pub fn descriptors() -> Vec<ParamDescriptor> {
         24,
     );
     push("bishop_center_mg".into(), placement, 4);
-    push("bishop_advance_mg".into(), placement, 1);
-    push("bishop_center_eg".into(), placement, 2);
-    push("rook_advance_mg".into(), placement, 3);
-    push("rook_center_eg".into(), placement, 0);
+    push("bishop_advance_mg".into(), placement, 0);
+    push("bishop_center_eg".into(), placement, 1);
+    push("rook_advance_mg".into(), placement, 2);
+    push("rook_center_eg".into(), placement, 1);
     push("rook_advance_eg".into(), placement, 2);
     push("queen_center_mg".into(), placement, 5);
-    push("queen_center_eg".into(), placement, 3);
-    push("king_center_mg".into(), placement, 8);
+    push("queen_center_eg".into(), placement, 2);
+    push("king_center_mg".into(), placement, 9);
     push("king_advance_mg".into(), placement, 2);
-    push("king_center_eg".into(), placement, 5);
-    push("king_advance_eg".into(), placement, 2);
+    push("king_center_eg".into(), placement, 6);
+    push("king_advance_eg".into(), placement, 3);
     let mobility_tables: [(&str, &str, &[i32]); 8] = [
         (
             "knight_mobility_mg",
@@ -655,44 +703,44 @@ pub fn descriptors() -> Vec<ParamDescriptor> {
     push(
         "passed_pawn_base".into(),
         "fn pawn_structure passed base literal 10",
-        8,
+        7,
     );
-    push("bishop_pair".into(), "fn pair_bonus literal 35", 39);
-    push("rook_open_file".into(), "fn rook_files literal 18", 20);
-    push("rook_semi_open_file".into(), "fn rook_files literal 10", 10);
-    push("king_castled_mg".into(), "fn king_term literal 22", 28);
+    push("bishop_pair".into(), "fn pair_bonus literal 35", 41);
+    push("rook_open_file".into(), "fn rook_files literal 18", 21);
+    push("rook_semi_open_file".into(), "fn rook_files literal 10", 11);
+    push("king_castled_mg".into(), "fn king_term literal 22", 29);
     push("king_shelter_mg".into(), "fn king_term literal 7", 9);
-    for (index, default) in [-2, 10, 8, 12, 19].into_iter().enumerate() {
+    for (index, default) in [-1, 10, 7, 12, 20].into_iter().enumerate() {
         push(
             format!("king_attack_weight[{index}]"),
             "const KING_ATTACK_WEIGHT (entry per PieceKind, king stays 0)",
             default,
         );
     }
-    push("king_ring_attack".into(), "const KING_RING_ATTACK", 15);
-    push("king_weak_square".into(), "const KING_WEAK_SQUARE", 9);
-    push("king_flank_defense".into(), "const KING_FLANK_DEFENSE", 5);
+    push("king_ring_attack".into(), "const KING_RING_ATTACK", 14);
+    push("king_weak_square".into(), "const KING_WEAK_SQUARE", 8);
+    push("king_flank_defense".into(), "const KING_FLANK_DEFENSE", 7);
     push(
         "king_pawnless_flank".into(),
         "const KING_PAWNLESS_FLANK",
-        18,
+        19,
     );
     push(
         "king_check_penalty".into(),
         "fn king_pressure_term in-check literal 35",
-        35,
+        36,
     );
-    push("knight_outpost_mg".into(), "const KNIGHT_OUTPOST.0", 27);
-    push("knight_outpost_eg".into(), "const KNIGHT_OUTPOST.1", 14);
+    push("knight_outpost_mg".into(), "const KNIGHT_OUTPOST.0", 28);
+    push("knight_outpost_eg".into(), "const KNIGHT_OUTPOST.1", 13);
     push("bishop_outpost_mg".into(), "const BISHOP_OUTPOST.0", 15);
-    push("bishop_outpost_eg".into(), "const BISHOP_OUTPOST.1", 8);
+    push("bishop_outpost_eg".into(), "const BISHOP_OUTPOST.1", 9);
     let reachable = "fn piece_activity reachable-outpost literal";
     push("knight_reachable_outpost_mg".into(), reachable, 13);
     push("knight_reachable_outpost_eg".into(), reachable, 6);
-    push("bishop_reachable_outpost_mg".into(), reachable, 7);
+    push("bishop_reachable_outpost_mg".into(), reachable, 9);
     push("bishop_reachable_outpost_eg".into(), reachable, 3);
     let behind = "fn piece_activity minor-behind-pawn literal";
-    push("minor_behind_pawn_mg".into(), behind, 8);
+    push("minor_behind_pawn_mg".into(), behind, 7);
     push("minor_behind_pawn_eg".into(), behind, 5);
     push(
         "knight_king_distance_mg".into(),
@@ -705,7 +753,7 @@ pub fn descriptors() -> Vec<ParamDescriptor> {
         2,
     );
     let diagonal = "fn piece_activity long-diagonal literal";
-    push("bishop_long_diagonal_mg".into(), diagonal, 8);
+    push("bishop_long_diagonal_mg".into(), diagonal, 9);
     push("bishop_long_diagonal_eg".into(), diagonal, 4);
     push(
         "rook_queen_file_mg".into(),
@@ -714,7 +762,7 @@ pub fn descriptors() -> Vec<ParamDescriptor> {
     );
     let seventh = "fn piece_activity seventh-rank literal";
     push("rook_seventh_mg".into(), seventh, 18);
-    push("rook_seventh_eg".into(), seventh, 27);
+    push("rook_seventh_eg".into(), seventh, 26);
     push(
         "trapped_rook_castle".into(),
         "fn piece_activity trapped-rook literal 10 (castling available)",
@@ -723,19 +771,19 @@ pub fn descriptors() -> Vec<ParamDescriptor> {
     push(
         "trapped_rook_no_castle".into(),
         "fn piece_activity trapped-rook literal 22 (castling gone)",
-        16,
+        15,
     );
     let advanced = "fn piece_activity advanced-queen literal";
     push("queen_advanced_mg".into(), advanced, 7);
-    push("queen_advanced_eg".into(), advanced, 10);
-    push("hanging_threat_mg".into(), "const HANGING_THREAT.0", 21);
+    push("queen_advanced_eg".into(), advanced, 11);
+    push("hanging_threat_mg".into(), "const HANGING_THREAT.0", 22);
     push("hanging_threat_eg".into(), "const HANGING_THREAT.1", 25);
     push(
         "restricted_threat_mg".into(),
         "const RESTRICTED_THREAT_MG",
-        4,
+        5,
     );
-    push("safe_pawn_threat_mg".into(), "const SAFE_PAWN_THREAT.0", 43);
+    push("safe_pawn_threat_mg".into(), "const SAFE_PAWN_THREAT.0", 44);
     push("safe_pawn_threat_eg".into(), "const SAFE_PAWN_THREAT.1", 30);
     push("pawn_push_threat_mg".into(), "const PAWN_PUSH_THREAT.0", 13);
     push("pawn_push_threat_eg".into(), "const PAWN_PUSH_THREAT.1", 8);
@@ -747,36 +795,69 @@ pub fn descriptors() -> Vec<ParamDescriptor> {
     push(
         "queen_knight_threat_eg".into(),
         "const QUEEN_KNIGHT_THREAT.1",
-        7,
+        6,
     );
     push(
         "queen_slider_threat_mg".into(),
         "const QUEEN_SLIDER_THREAT.0",
-        15,
+        16,
     );
     push(
         "queen_slider_threat_eg".into(),
         "const QUEEN_SLIDER_THREAT.1",
-        4,
+        5,
     );
     let minor_threat = "fn minor_threat_scores typed table";
-    push("minor_threat_pawn_mg".into(), minor_threat, 6);
-    push("minor_threat_pawn_eg".into(), minor_threat, 15);
-    push("minor_threat_minor_mg".into(), minor_threat, 32);
+    push("minor_threat_pawn_mg".into(), minor_threat, 7);
+    push("minor_threat_pawn_eg".into(), minor_threat, 14);
+    push("minor_threat_minor_mg".into(), minor_threat, 33);
     push("minor_threat_minor_eg".into(), minor_threat, 25);
-    push("minor_threat_rook_mg".into(), minor_threat, 48);
+    push("minor_threat_rook_mg".into(), minor_threat, 50);
     push("minor_threat_rook_eg".into(), minor_threat, 37);
     push("minor_threat_queen_mg".into(), minor_threat, 57);
-    push("minor_threat_queen_eg".into(), minor_threat, 70);
+    push("minor_threat_queen_eg".into(), minor_threat, 73);
     let rook_threat = "fn rook_threat_scores typed table";
-    push("rook_threat_pawn_mg".into(), rook_threat, 4);
+    push("rook_threat_pawn_mg".into(), rook_threat, 3);
     push("rook_threat_pawn_eg".into(), rook_threat, 28);
-    push("rook_threat_minor_mg".into(), rook_threat, 24);
-    push("rook_threat_minor_eg".into(), rook_threat, 36);
-    push("rook_threat_rook_mg".into(), rook_threat, 0);
+    push("rook_threat_minor_mg".into(), rook_threat, 25);
+    push("rook_threat_minor_eg".into(), rook_threat, 37);
+    push("rook_threat_rook_mg".into(), rook_threat, 1);
     push("rook_threat_rook_eg".into(), rook_threat, 18);
-    push("rook_threat_queen_mg".into(), rook_threat, 41);
-    push("rook_threat_queen_eg".into(), rook_threat, 36);
+    push("rook_threat_queen_mg".into(), rook_threat, 39);
+    push("rook_threat_queen_eg".into(), rook_threat, 35);
+    push(
+        "passed_own_king_distance".into(),
+        "released parameter without a public tuning site",
+        0,
+    );
+    push(
+        "passed_enemy_king_distance".into(),
+        "released parameter without a public tuning site",
+        0,
+    );
+    push(
+        "passed_rook_behind".into(),
+        "released parameter without a public tuning site",
+        0,
+    );
+    push(
+        "passed_outside_file".into(),
+        "released parameter without a public tuning site",
+        0,
+    );
+    for kind in ["pawn", "knight", "bishop", "rook", "queen", "king"] {
+        for folded in 0..32 {
+            let row = folded / 4;
+            let file = folded % 4;
+            for phase in ["mg", "eg"] {
+                push(
+                    format!("psq_delta_{kind}_r{row}f{file}_{phase}"),
+                    "released parameter without a public tuning site",
+                    0,
+                );
+            }
+        }
+    }
     assert_eq!(list.len(), PARAM_COUNT, "descriptor layout size is frozen");
     list
 }
@@ -940,6 +1021,18 @@ mod idx {
     pub const MINOR_THREAT: usize = 207;
     /// First typed rook-threat slot (pawn target, middlegame).
     pub const ROOK_THREAT: usize = 215;
+    /// Alternative configuration retained for controlled evaluation.
+    pub const PASSED_OWN_KING_DISTANCE: usize = 223;
+    /// Enemy king distance to an advanced passer's front square.
+    pub const PASSED_ENEMY_KING_DISTANCE: usize = 224;
+    /// Friendly rook behind an advanced passer.
+    pub const PASSED_ROOK_BEHIND: usize = 225;
+    /// Advanced passer's distance from the central files.
+    pub const PASSED_OUTSIDE_FILE: usize = 226;
+    /// Alternative configuration retained for controlled evaluation.
+    ///
+    /// The block is `6` kinds x `32` folded squares x `[mg, eg]`, kind-major.
+    pub const PIECE_SQUARE_DELTA: usize = 227;
 }
 
 /// Used for looking up the parameterized middlegame and endgame safe-mobility
@@ -1029,7 +1122,37 @@ fn tapered_piece_square_params(
             center * params.king_center_eg + advance * params.king_advance_eg,
         ),
     };
+    // Folded in before the taper on purpose. The promoted form bakes these
+    // into the compile-time placement table, which is tapered per piece at
+    // lookup, so tapering the delta separately would leave the released
+    // engine differing from the fitted one by a rounding residue -- and the
+    // transcription proof requires exactly 50.0000%.
+    let folded = super::folded_placement_index(piece.color, square);
+    let delta = params.piece_square_delta[piece.kind.index()][folded];
+    let middle = middle + delta[0];
+    let ending = ending + delta[1];
     (middle * phase + ending * (MAX_PHASE - phase)) / MAX_PHASE
+}
+
+/// Used for appending the placement-delta block to the flat slot layout.
+///
+/// Split out of [`ClassicalParams::slots_mut`] only to keep that function
+/// under the crate's line limit; the ordering it produces -- kind-major, then
+/// folded square, then `[mg, eg]` -- is what fixes the layout indices.
+///
+/// # Arguments
+///
+/// * `slots` - accumulating slot list, appended to in layout order
+/// * `delta` - placement delta block to expose
+fn extend_with_placement_delta<'a>(
+    slots: &mut Vec<&'a mut i32>,
+    delta: &'a mut [[[i32; 2]; 32]; 6],
+) {
+    for kind in delta.iter_mut() {
+        for folded in kind.iter_mut() {
+            slots.extend(folded.iter_mut());
+        }
+    }
 }
 
 /// Used for the parameterized knight edge penalty.
@@ -1106,12 +1229,96 @@ fn pawn_structure_params(
                 let advance = i32::from(relative_rank.saturating_sub(1));
                 let bonus = params.passed_pawn_base + PASSED_PAWN_QUADRATIC * advance * advance;
                 let push_row = if color == Color::White { -1 } else { 1 };
-                let blocked = square_offset(square, 0, push_row)
-                    .is_some_and(|front| position.piece_at(front).is_some());
+                let front = square_offset(square, 0, push_row);
+                let blocked = front.is_some_and(|front| position.piece_at(front).is_some());
                 score += sign * if blocked { bonus / 2 } else { bonus };
+                score += sign
+                    * passed_pawn_geometry(
+                        params,
+                        position,
+                        color,
+                        square,
+                        i32::from(relative_rank),
+                        front,
+                    );
             }
         }
     }
+    score
+}
+
+/// Alternative configuration retained for controlled evaluation.
+///
+/// Returns the color-relative bonus a single true passer earns from where it
+/// sits rather than merely how far it has advanced: both king distances to its
+/// front square, a friendly rook behind it, and its distance from the central
+/// files. Every reference classical evaluator conditions advanced passers this
+/// way and Janus's release does not.
+///
+/// The geometry is copied term for term from `accumulate_passed_pawn_features`
+/// in the parent module, which has been extracting these features through the
+/// released true-passer traversal since `INFRA-20260804-291`. Reusing it means
+/// a fitted weight here means the same thing the offline feature meant.
+///
+/// `urgency` gates the whole group to passers on the fourth relative rank and
+/// beyond, exactly as the feature extractor does; king distances scale with
+/// `urgency` and the remaining terms with `urgency^2`.
+///
+/// # Arguments
+///
+/// * `params` - runtime parameter set supplying the four weights
+/// * `position` - position holding the passer
+/// * `color` - color of the passer
+/// * `square` - square the passer stands on
+/// * `relative_rank` - rank counted from `color`'s own back rank
+/// * `front` - the passer's push square, or `None` off the board
+///
+/// # Returns
+///
+/// Color-relative geometry bonus; zero at the released defaults, which is what
+/// keeps the parameterized evaluator an exact reproduction of the release.
+fn passed_pawn_geometry(
+    params: &ClassicalParams,
+    position: &Position,
+    color: Color,
+    square: Square,
+    relative_rank: i32,
+    front: Option<Square>,
+) -> i32 {
+    let urgency = (relative_rank - 3).max(0);
+    let Some(front) = front.filter(|_| urgency > 0) else {
+        return 0;
+    };
+    let rank_weight = urgency * urgency;
+    let enemy = color.opposite();
+    let mut score = 0;
+
+    if let Some(king) = position.king_square(color) {
+        score += params.passed_own_king_distance * urgency * king_distance(king, front);
+    }
+    if let Some(king) = position.king_square(enemy) {
+        score += params.passed_enemy_king_distance * urgency * king_distance(king, front);
+    }
+
+    let (_, rear_path) = passed_file_masks(square, color);
+    let rear_blockers = position.occupancy() & rear_path;
+    if rear_blockers != 0 {
+        // The nearest rearward occupant decides, so a rook screened by another
+        // piece earns nothing -- the same rule the feature extractor applies.
+        let rear_index = if color == Color::White {
+            rear_blockers.trailing_zeros()
+        } else {
+            u64::BITS - 1 - rear_blockers.leading_zeros()
+        };
+        let rooks = position.piece_bitboard(Piece::new(color, PieceKind::Rook));
+        if rooks & (1_u64 << rear_index) != 0 {
+            score += params.passed_rook_behind * rank_weight;
+        }
+    }
+
+    let file_from_center = (2 * i32::from(square.file()) - 7).abs();
+    score += params.passed_outside_file * rank_weight * file_from_center;
+
     score
 }
 
@@ -1542,11 +1749,9 @@ fn side_threats_params(
     middle += bit_count(pawn_push_threats) * params.pawn_push_threat_mg;
     ending += bit_count(pawn_push_threats) * params.pawn_push_threat_eg;
 
+    // Historical calibration detail omitted from the public source release.
     let enemy_queens = position.piece_bitboard(Piece::new(enemy, PieceKind::Queen));
-    if enemy_queens != 0 {
-        let queen = board_square(
-            u8::try_from(enemy_queens.trailing_zeros()).expect("set bit index is below 64"),
-        );
+    if let Some(queen) = super::lone_square(enemy_queens) {
         let safe_knight_pressure =
             attacks.by_kind[side][PieceKind::Knight.index()] & knight_attacks(queen) & safe;
         middle += bit_count(safe_knight_pressure) * params.queen_knight_threat_mg;
@@ -1751,6 +1956,7 @@ pub fn params_breakdown(position: &Position, params: &ClassicalParams) -> Classi
         }
     }
 
+    let attacks = attack_maps_params(params, position);
     result.pawns = pawn_structure_params(params, position, file_pawns);
     result.bishops = {
         let white = i32::from(bishops[Color::White.index()] >= 2) * params.bishop_pair;
@@ -1759,7 +1965,6 @@ pub fn params_breakdown(position: &Position, params: &ClassicalParams) -> Classi
     };
     result.rooks = rook_files_params(params, position, file_pawns);
     result.kings = king_term_params(params, position, phase);
-    let attacks = attack_maps_params(params, position);
     result.mobility = mobility_term(&attacks, phase);
     result.activity = activity_term(&attacks, phase);
     result.threats = rich_threat_term_params(params, position, &attacks, phase);
@@ -2025,16 +2230,11 @@ pub fn linear_model(position: &Position) -> LinearModel {
     }
     king_pressure_coefficients(&mut sink, position, &maps);
 
-    // The promoted STR-280 king-danger correction is non-linear in the king
-    // parameters, so it enters as an already-tapered frozen constant. Adding
-    // the same centipawn amount to both phases reproduces it exactly at every
-    // phase without pretending it scales with a tuned weight.
+    // Historical calibration detail omitted from the public source release.
     let promoted_king_danger = f64::from(super::king_danger_promoted_delta(position));
     sink.add_constant(promoted_king_danger, promoted_king_danger);
 
-    // STR-319's connected-pawn ramp and STR-304's king-to-pawn-file distance
-    // are built from named constants rather than tunable parameters, so they
-    // enter as already-tapered frozen constants for the same reason.
+    // Historical calibration detail omitted from the public source release.
     let (connected_pawns, king_pawn_file) = super::promoted_capacity_delta(position);
     let promoted_capacity = f64::from(connected_pawns) + f64::from(king_pawn_file);
     sink.add_constant(promoted_capacity, promoted_capacity);
@@ -2068,6 +2268,10 @@ fn placement_coefficients(sink: &mut CoefficientSink, piece: Piece, square: Squa
     };
     let center = f64::from(14 - ((2 * file - 7).abs() + (2 * (rank - 1) - 7).abs()));
     let advance = f64::from(relative - 1);
+    let folded = super::folded_placement_index(piece.color, square);
+    let delta_slot = idx::PIECE_SQUARE_DELTA + (piece.kind.index() * 32 + folded) * 2;
+    sink.add(delta_slot, sign, 0.0);
+    sink.add(delta_slot + 1, 0.0, sign);
     match piece.kind {
         PieceKind::Pawn => {
             sink.add(idx::PAWN_ADVANCE_MG, sign * advance, 0.0);
@@ -2157,6 +2361,40 @@ fn pawn_coefficients(sink: &mut CoefficientSink, position: &Position, file_pawns
                 let quadratic =
                     sign * factor * f64::from(PASSED_PAWN_QUADRATIC) * advance * advance;
                 sink.add_constant(quadratic, quadratic);
+
+                // Historical calibration detail omitted from the public source release.
+                let relative_rank = f64::from(relative_rank);
+                let urgency = (relative_rank - 3.0).max(0.0);
+                let front = square_offset(square, 0, push_row);
+                if let (true, Some(front)) = (urgency > 0.0, front) {
+                    let rank_weight = urgency * urgency;
+                    if let Some(king) = position.king_square(color) {
+                        let distance = f64::from(king_distance(king, front));
+                        sink.add_flat(idx::PASSED_OWN_KING_DISTANCE, sign * urgency * distance);
+                    }
+                    if let Some(king) = position.king_square(color.opposite()) {
+                        let distance = f64::from(king_distance(king, front));
+                        sink.add_flat(idx::PASSED_ENEMY_KING_DISTANCE, sign * urgency * distance);
+                    }
+                    let (_, rear_path) = passed_file_masks(square, color);
+                    let rear_blockers = position.occupancy() & rear_path;
+                    if rear_blockers != 0 {
+                        let rear_index = if color == Color::White {
+                            rear_blockers.trailing_zeros()
+                        } else {
+                            u64::BITS - 1 - rear_blockers.leading_zeros()
+                        };
+                        let rooks = position.piece_bitboard(Piece::new(color, PieceKind::Rook));
+                        if rooks & (1_u64 << rear_index) != 0 {
+                            sink.add_flat(idx::PASSED_ROOK_BEHIND, sign * rank_weight);
+                        }
+                    }
+                    let file_from_center = f64::from((2 * i32::from(square.file()) - 7).abs());
+                    sink.add_flat(
+                        idx::PASSED_OUTSIDE_FILE,
+                        sign * rank_weight * file_from_center,
+                    );
+                }
             }
         }
     }
@@ -2417,11 +2655,9 @@ fn threat_coefficients(
     sink.add(idx::PAWN_PUSH_THREAT_MG, sign * push_count, 0.0);
     sink.add(idx::PAWN_PUSH_THREAT_EG, 0.0, sign * push_count);
 
+    // Historical calibration detail omitted from the public source release.
     let enemy_queens = position.piece_bitboard(Piece::new(enemy, PieceKind::Queen));
-    if enemy_queens != 0 {
-        let queen = board_square(
-            u8::try_from(enemy_queens.trailing_zeros()).expect("set bit index is below 64"),
-        );
+    if let Some(queen) = super::lone_square(enemy_queens) {
         let safe_knight_pressure =
             attacks.by_kind[side][PieceKind::Knight.index()] & knight_attacks(queen) & safe;
         let knight_count = f64::from(bit_count(safe_knight_pressure));
@@ -2568,4 +2804,3 @@ fn king_pressure_coefficients(
         }
     }
 }
-

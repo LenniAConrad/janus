@@ -290,7 +290,7 @@ struct MagicEntry {
 ///
 /// Bishop attack bitboard under the given occupancy.
 #[inline]
-pub(super) fn bishop_attacks(square: u8, occupancy: u64) -> u64 {
+pub fn bishop_attacks(square: u8, occupancy: u64) -> u64 {
     let tables = TABLES.get_or_init(SlidingTables::new);
     tables.lookup(&tables.bishops[square as usize], occupancy)
 }
@@ -307,7 +307,7 @@ pub(super) fn bishop_attacks(square: u8, occupancy: u64) -> u64 {
 ///
 /// Rook attack bitboard under the given occupancy.
 #[inline]
-pub(super) fn rook_attacks(square: u8, occupancy: u64) -> u64 {
+pub fn rook_attacks(square: u8, occupancy: u64) -> u64 {
     let tables = TABLES.get_or_init(SlidingTables::new);
     tables.lookup(&tables.rooks[square as usize], occupancy)
 }
@@ -420,8 +420,6 @@ fn build_magic(
         offset,
     }
 }
-
-
 
 /// Used for computing reference bishop attacks through the square's two
 /// diagonals.
@@ -550,4 +548,3 @@ fn line_attacks(square: u8, occupancy: u64, mask: u64) -> u64 {
 const fn on_board(file: i8, row: i8) -> bool {
     file >= 0 && file < 8 && row >= 0 && row < 8
 }
-

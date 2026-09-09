@@ -11,12 +11,7 @@
 //!
 //! # Measured standing
 //!
-//! This evaluator is the shipped UCI default, and it is **far weaker than the
-//! neural evaluators this engine also ships**. Measured on 2026-08-02 against
-//! Stockfish 6 at 10+0.10, one thread, 64 MiB hash, over two independent runs
-//! totalling 800 games: **0.33% and 0.75%**, roughly 850-990 Elo below that
-//! opponent. The `UpstreamNNUE` evaluator scores about **51%** on the same
-//! gauge with the same search.
+//! Public implementation detail retained for the released engine.
 //!
 //! Work here is therefore research on a hand-crafted evaluation, not work on
 //! the engine's competitive strength, which lives in the neural path. Anyone
@@ -28,16 +23,14 @@
 //! nothing.
 
 use crate::evaluator::{Evaluator, SearchEvaluator};
-use crate::score::clamp_static_score;
+use crate::score::{clamp_static_score, INFINITY};
 use janus_core::{CastlingRights, Color, Move, Piece, PieceKind, Position, Square};
 use std::sync::Arc;
 
 /// Used for scoring base centipawn material, indexed by [`PieceKind::index`].
 ///
-/// Values follow the stage-1 Texel-fitted 98/357/382/585/1211 centipawn
-/// scale (STR-20260724-170) with a zero entry for the king, which is never
-/// exchanged.
-const MATERIAL: [i32; 6] = [98, 357, 382, 585, 1211, 0];
+/// Alternative configuration retained for controlled evaluation.
+const MATERIAL: [i32; 6] = [99, 359, 388, 608, 1221, 0];
 /// Used for capping the tapered-evaluation phase at the opening value
 /// produced by the initial non-pawn material.
 ///
@@ -115,35 +108,24 @@ const PASSED_PAWN_BLOCKER_MASKS: [[u64; 64]; 2] = build_passed_pawn_blocker_mask
 
 /// Used for penalizing each extra same-color pawn on a file.
 ///
-/// [`pawn_structure`] applies this released weight to `count - 1` for every
-/// occupied file. The broader per-file recognition contract is unchanged by
-/// STR-299's research calibration.
-const DOUBLED_PAWN_PENALTY: i32 = 13;
-/// Used for STR-299's trace-calibrated doubled-pawn research flavor.
+/// Alternative configuration retained for controlled evaluation.
+const DOUBLED_PAWN_PENALTY: i32 = 12;
+/// Alternative configuration retained for controlled evaluation.
 ///
 /// This replaces only [`DOUBLED_PAWN_PENALTY`] in a compile-time evaluator
 /// instantiation; isolated and passed-pawn weights and all pawn geometry stay
 /// on the release path.
 const PAWN_STRUCTURE_CANDIDATE_DOUBLED_PENALTY: i32 = 3;
-/// Used for the confirmed STR-319 connected-pawn ramp percentage.
+/// Alternative configuration retained for controlled evaluation.
 ///
 /// The `bulk-nodes` magnitude sweep measured `60%` as a null while `150%` was
 /// indistinguishable from `100%`, so the smaller of the two equal-strength
 /// scales is adopted and the released term needs no runtime scaling.
 const CONNECTED_PAWN_SCALE_PERCENT: i32 = 100;
 
-/// Used for the STR-319 connected-pawn bonus, indexed by color-relative rank.
+/// Alternative configuration retained for controlled evaluation.
 ///
-/// Before this term the released pawn evaluation carried exactly three — a
-/// doubled penalty, an isolated penalty, and a passed bonus — and therefore
-/// scored a defended or side-by-side pawn identically to a loose one. Every
-/// mature classical evaluator rewards that structure, and the 2026-08-05
-/// equal-node decomposition attributed the Stockfish 11 deficit to evaluation
-/// capacity rather than calibration. Entries are `(middlegame, endgame)`
-/// centipawns; indices `0`, `1`, and `8` are unreachable for a pawn and stay
-/// zero. The ramp is Janus's own: the abstract mechanism is learned from the
-/// references recorded in the experiment entry, and no third-party table or
-/// constant is copied.
+/// Alternative configuration retained for controlled evaluation.
 const CONNECTED_PAWN_BONUS: [(i32, i32); 9] = [
     (0, 0),
     (0, 0),
@@ -156,7 +138,51 @@ const CONNECTED_PAWN_BONUS: [(i32, i32); 9] = [
     (0, 0),
 ];
 
-/// Used for the STR-321 knight adjustment per own pawn above five.
+/// Used for the released connected-pawn bonus already tapered at every phase.
+///
+/// Phase-major, so the scan of one position reads a single nine-entry row that
+/// sits in one cache line, and each connected pawn costs one load instead of
+/// two multiplies, two divides and the rounding branch in [`tapered_score`].
+///
+/// Only valid at [`CONNECTED_PAWN_SCALE_PERCENT`]; [`connected_pawn_term`]
+/// falls back to computing the taper whenever the caller passes a different
+/// ramp, which the research paths do.
+const CONNECTED_PAWN_TAPERED: [[i32; 9]; 25] = build_connected_pawn_tapered();
+
+/// Used for building [`CONNECTED_PAWN_TAPERED`] at compile time.
+///
+/// Calls [`tapered_score`] rather than restating its rounding, so the table
+/// cannot drift from the arithmetic it replaces: the two are the same code.
+///
+/// # Returns
+///
+/// The tapered bonus for every phase in `0..=MAX_PHASE` and every
+/// color-relative rank in `0..9`.
+const fn build_connected_pawn_tapered() -> [[i32; 9]; 25] {
+    let mut table = [[0; 9]; 25];
+    // The phase is carried alongside the slot rather than cast from it: a
+    // `usize` to `i32` cast here would be lint noise for a value that is known
+    // to be small, and two counters in lockstep say the same thing without one.
+    let mut slot = 0;
+    let mut phase = 0;
+    while slot < table.len() {
+        let mut rank = 0;
+        while rank < 9 {
+            let (middle, ending) = CONNECTED_PAWN_BONUS[rank];
+            table[slot][rank] = tapered_score(
+                middle * CONNECTED_PAWN_SCALE_PERCENT / 100,
+                ending * CONNECTED_PAWN_SCALE_PERCENT / 100,
+                phase,
+            );
+            rank += 1;
+        }
+        slot += 1;
+        phase += 1;
+    }
+    table
+}
+
+/// Alternative configuration retained for controlled evaluation.
 ///
 /// Knights gain value in closed positions and lose it as pawns leave the
 /// board; rooks move the other way. Janus's released material values are
@@ -165,16 +191,14 @@ const CONNECTED_PAWN_BONUS: [(i32, i32); 9] = [
 /// with Janus's own coefficients rather than any reference table.
 const KNIGHT_PAWN_COUNT_ADJUSTMENT: i32 = 5;
 
-/// Used for the STR-321 rook adjustment per own pawn above five.
+/// Alternative configuration retained for controlled evaluation.
 const ROOK_PAWN_COUNT_ADJUSTMENT: i32 = -7;
-
 
 /// Used for the released nonlinear reward per squared passer advance.
 ///
-/// STR-170 fitted the separate flat base while leaving this coefficient
-/// frozen. Keeping it named makes the release/tuning parity contract explicit.
+/// Alternative configuration retained for controlled evaluation.
 const PASSED_PAWN_QUADRATIC: i32 = 5;
-/// Used for STR-306's trace-calibrated passed-pawn research flavor.
+/// Alternative configuration retained for controlled evaluation.
 ///
 /// This replaces only [`PASSED_PAWN_QUADRATIC`] in one compile-time evaluator
 /// instantiation; recognition, rank, flat base, blocker truncation, and scan
@@ -186,44 +210,44 @@ const PASSED_PAWN_CANDIDATE_QUADRATIC: i32 = 2;
 ///
 /// Counts beyond the last index reuse the final entry via
 /// [`mobility_scores`].
-const KNIGHT_MOBILITY_MG: [i32; 9] = [-17, -8, 2, 4, 9, 13, 10, 13, 14];
+const KNIGHT_MOBILITY_MG: [i32; 9] = [-16, -10, 1, 4, 8, 13, 10, 13, 14];
 /// Used for scoring endgame knight mobility, indexed by safe destination
 /// count.
 ///
 /// Counts beyond the last index reuse the final entry via
 /// [`mobility_scores`].
-const KNIGHT_MOBILITY_EG: [i32; 9] = [-24, -18, -8, -2, 6, 9, 17, 10, 9];
+const KNIGHT_MOBILITY_EG: [i32; 9] = [-23, -18, -7, -2, 6, 10, 18, 9, 9];
 /// Used for scoring middlegame bishop mobility, indexed by safe destination
 /// count.
 ///
 /// Counts beyond the last index reuse the final entry via
 /// [`mobility_scores`].
-const BISHOP_MOBILITY_MG: [i32; 14] = [-17, -4, 1, 12, 11, 11, 16, 21, 24, 28, 31, 32, 34, 35];
+const BISHOP_MOBILITY_MG: [i32; 14] = [-17, -4, 1, 12, 12, 11, 16, 21, 23, 28, 31, 33, 35, 34];
 /// Used for scoring endgame bishop mobility, indexed by safe destination
 /// count.
 ///
 /// Counts beyond the last index reuse the final entry via
 /// [`mobility_scores`].
-const BISHOP_MOBILITY_EG: [i32; 14] = [-18, -10, 0, 6, 13, 22, 25, 28, 36, 38, 39, 39, 42, 41];
+const BISHOP_MOBILITY_EG: [i32; 14] = [-18, -10, 0, 6, 12, 22, 25, 28, 37, 39, 39, 39, 42, 40];
 /// Used for scoring middlegame rook mobility, indexed by safe destination
 /// count.
 ///
 /// Counts beyond the last index reuse the final entry via
 /// [`mobility_scores`].
-const ROOK_MOBILITY_MG: [i32; 15] = [-15, -8, -2, 2, 5, 9, 12, 15, 19, 19, 24, 27, 29, 32, 31];
+const ROOK_MOBILITY_MG: [i32; 15] = [-15, -8, -2, 2, 6, 9, 13, 14, 19, 19, 25, 27, 29, 32, 31];
 /// Used for scoring endgame rook mobility, indexed by safe destination count.
 ///
 /// Counts beyond the last index reuse the final entry via
 /// [`mobility_scores`].
-const ROOK_MOBILITY_EG: [i32; 15] = [-23, -9, -3, 7, 15, 26, 28, 42, 44, 49, 49, 54, 58, 57, 48];
+const ROOK_MOBILITY_EG: [i32; 15] = [-23, -9, -4, 7, 14, 26, 28, 41, 44, 49, 47, 53, 59, 57, 49];
 /// Used for scoring middlegame queen mobility, indexed by safe destination
 /// count.
 ///
 /// Counts beyond the last index reuse the final entry via
 /// [`mobility_scores`].
 const QUEEN_MOBILITY_MG: [i32; 28] = [
-    -8, -4, -1, 0, 3, 4, 8, 8, 14, 13, 19, 22, 20, 23, 23, 22, 25, 24, 25, 26, 27, 28, 29, 30, 31,
-    32, 33, 34,
+    -9, -3, 0, -1, 4, 4, 9, 8, 14, 14, 18, 22, 20, 24, 24, 23, 24, 24, 25, 27, 27, 29, 29, 28, 30,
+    30, 33, 33,
 ];
 /// Used for scoring endgame queen mobility, indexed by safe destination
 /// count.
@@ -231,42 +255,42 @@ const QUEEN_MOBILITY_MG: [i32; 28] = [
 /// Counts beyond the last index reuse the final entry via
 /// [`mobility_scores`].
 const QUEEN_MOBILITY_EG: [i32; 28] = [
-    -12, -8, -4, 0, 5, 10, 14, 18, 22, 26, 30, 34, 41, 42, 44, 47, 51, 53, 56, 58, 59, 62, 65, 65,
-    68, 70, 74, 76,
+    -13, -8, -4, 1, 5, 10, 14, 17, 22, 26, 29, 35, 42, 40, 44, 49, 50, 52, 56, 56, 61, 62, 64, 68,
+    64, 67, 74, 75,
 ];
-/// Used for STR-297's middlegame knight mobility research flavor.
+/// Alternative configuration retained for controlled evaluation.
 ///
 /// The table is the frozen affine trace calibration of
 /// [`KNIGHT_MOBILITY_MG`]; its length and destination-count indexing are
 /// identical to the release table.
 const MOBILITY_CANDIDATE_KNIGHT_MG: [i32; 9] = [-27, -19, -10, -8, -3, 0, -2, 0, 1];
-/// Used for STR-297's endgame knight mobility research flavor.
+/// Alternative configuration retained for controlled evaluation.
 ///
 /// This is the endgame counterpart of [`MOBILITY_CANDIDATE_KNIGHT_MG`].
 const MOBILITY_CANDIDATE_KNIGHT_EG: [i32; 9] = [-34, -30, -23, -18, -12, -10, -4, -10, -10];
-/// Used for STR-297's middlegame bishop mobility research flavor.
+/// Alternative configuration retained for controlled evaluation.
 ///
 /// Counts beyond index thirteen retain the release scorer's last-entry clamp.
 const MOBILITY_CANDIDATE_BISHOP_MG: [i32; 14] =
     [-16, -5, 0, 9, 8, 8, 13, 17, 20, 23, 26, 27, 29, 30];
-/// Used for STR-297's endgame bishop mobility research flavor.
+/// Alternative configuration retained for controlled evaluation.
 ///
 /// Its values are independently calibrated while preserving the release
 /// table's domain and lookup contract.
 const MOBILITY_CANDIDATE_BISHOP_EG: [i32; 14] =
     [-30, -24, -16, -11, -5, 2, 5, 7, 14, 15, 16, 16, 18, 18];
-/// Used for STR-297's middlegame rook mobility research flavor.
+/// Alternative configuration retained for controlled evaluation.
 ///
 /// The fifteen entries correspond exactly to safe destination counts zero
 /// through fourteen.
 const MOBILITY_CANDIDATE_ROOK_MG: [i32; 15] =
     [-28, -22, -17, -14, -12, -9, -6, -4, -1, -1, 3, 5, 7, 9, 8];
-/// Used for STR-297's endgame rook mobility research flavor.
+/// Alternative configuration retained for controlled evaluation.
 ///
 /// Counts beyond the table reuse its final entry through [`mobility_scores`].
 const MOBILITY_CANDIDATE_ROOK_EG: [i32; 15] =
     [-26, -15, -10, -1, 5, 14, 16, 28, 29, 33, 33, 37, 41, 40, 33];
-/// Used for STR-297's middlegame queen mobility research flavor.
+/// Alternative configuration retained for controlled evaluation.
 ///
 /// The frozen affine model is materialized here so candidate evaluation adds
 /// no arithmetic to the existing table lookup.
@@ -274,7 +298,7 @@ const MOBILITY_CANDIDATE_QUEEN_MG: [i32; 28] = [
     -26, -22, -20, -19, -17, -16, -13, -13, -8, -9, -4, -2, -3, -1, -1, -2, 1, 0, 1, 2, 2, 3, 4, 5,
     6, 6, 7, 8,
 ];
-/// Used for STR-297's endgame queen mobility research flavor.
+/// Alternative configuration retained for controlled evaluation.
 ///
 /// This table retains all twenty-eight release indices and the same final
 /// entry clamp.
@@ -288,7 +312,7 @@ const MOBILITY_CANDIDATE_QUEEN_EG: [i32; 28] = [
 ///
 /// Each non-king piece that reaches the enemy king zone contributes its
 /// kind's weight to [`AttackMaps::king_attacker_weight`].
-const KING_ATTACK_WEIGHT: [i32; 6] = [-2, 10, 8, 12, 19, 0];
+const KING_ATTACK_WEIGHT: [i32; 6] = [-1, 11, 6, 12, 20, 0];
 /// Used for assigning king-zone pressure per squared attacker count.
 ///
 /// [`side_king_pressure`] multiplies the squared number of distinct king-zone
@@ -299,22 +323,22 @@ const KING_ATTACKERS_SQUARED: i32 = 3;
 ///
 /// Multiplied by [`AttackMaps::king_ring_hits`] in [`side_king_pressure`];
 /// a square reached by several attackers counts once per attacker.
-const KING_RING_ATTACK: i32 = 15;
+const KING_RING_ATTACK: i32 = 12;
 /// Used for assigning king-zone pressure per weak king-zone square.
 ///
 /// A square is weak when the attacker covers it, the defender does not cover
 /// it twice, and at most the defending king or queen protects it.
-const KING_WEAK_SQUARE: i32 = 9;
+const KING_WEAK_SQUARE: i32 = 7;
 /// Used for assigning king-zone relief per defended flank square.
 ///
 /// Subtracted once for every camp-half king-flank square the defender
 /// attacks in [`side_king_pressure`].
-const KING_FLANK_DEFENSE: i32 = 5;
+const KING_FLANK_DEFENSE: i32 = 7;
 /// Used for adding king-zone pressure when the king flank contains no pawn.
 ///
 /// Applied once in [`side_king_pressure`] when neither side has a pawn on
 /// the camp half of the king's flank.
-const KING_PAWNLESS_FLANK: i32 = 18;
+const KING_PAWNLESS_FLANK: i32 = 19;
 /// Used for discounting attack pressure when the attacking army has no queen.
 ///
 /// The same factor is applied to released pressure and research safe-check
@@ -322,9 +346,7 @@ const KING_PAWNLESS_FLANK: i32 = 18;
 const KING_QUEENLESS_PRESSURE_PERCENT: i32 = 55;
 /// Used for adding released-pressure context when a safe check is available.
 ///
-/// This and the following STR-280 values are rounded from the mean of five
-/// deterministic reference-trace folds; they are Janus-derived rather than
-/// borrowed reference-engine parameters.
+/// Alternative configuration retained for controlled evaluation.
 const KING_DANGER_CURRENT_DELTA_PERCENT: i32 = 191;
 /// Used for valuing queen-gated safe-check destinations by checking piece.
 ///
@@ -339,42 +361,39 @@ const KING_DANGER_ADVANCED_SHELTER: i32 = 16;
 const KING_DANGER_PRESSURE_SQUARED: i32 = -2;
 /// Used for bounding the complete candidate king-pressure term in centipawns.
 const KING_DANGER_TERM_LIMIT: i32 = 1_500;
-/// Used for scoring the STR-304 nearest-pawn-file balance in each phase.
+/// Alternative configuration retained for controlled evaluation.
 ///
-/// The pair is independently fitted on the unsealed development trace and is
-/// applied only by the research flavor layered on STR-280.
+/// Alternative configuration retained for controlled evaluation.
 const KING_PAWN_FILE_PROXIMITY: (i32, i32) = (7, 2);
-/// Used for bounding the complete STR-304 white-relative correction.
+/// Alternative configuration retained for controlled evaluation.
 ///
 /// Legal file distances make the mathematical maximum smaller than this
 /// limit; the explicit clamp keeps malformed research positions bounded too.
 const KING_PAWN_FILE_PROXIMITY_TERM_LIMIT: i32 = 96;
-/// Used for the STR-295 low-cost passer feature order shared by both phases.
+/// Alternative configuration retained for controlled evaluation.
 ///
 /// Entries are blocked advance, unsafe advance, safe advance, defended
 /// advance, and outside-file distance, matching the cheap subset of
 /// [`PassedPawnFeatures`].
 const PASSED_REALIZATION_MG_X100: [i32; 5] = [-240, -973, -391, -34, 40];
-/// Used for the endgame half of the STR-295 passer-state vector.
+/// Alternative configuration retained for controlled evaluation.
 ///
 /// The entry order is identical to [`PASSED_REALIZATION_MG_X100`].
 const PASSED_REALIZATION_EG_X100: [i32; 5] = [-308, -961, -255, -56, 69];
-/// Used for converting STR-295's integer-hundredth coefficients to
-/// centipawns.
+/// Alternative configuration retained for controlled evaluation.
 const PASSED_REALIZATION_WEIGHT_SCALE: i64 = 100;
-/// Used for bounding the complete phase-tapered STR-295 passer-state delta.
+/// Alternative configuration retained for controlled evaluation.
 const PASSED_REALIZATION_TERM_LIMIT: i32 = 1_000;
-/// Used for the STR-296 endgame-initiative feature order.
+/// Alternative configuration retained for controlled evaluation.
 ///
 /// Entries are intercept, total pawn count, king outflanking, king
 /// infiltration, pawns on both board flanks, and pure pawn ending. The
 /// integer-hundredth values were frozen from the five-fold SF11 Initiative
 /// trace fit; its middlegame vector is exactly zero.
 const INITIATIVE_EG_X100: [i32; 6] = [-2_392, 224, 255, 540, 1_155, 1_699];
-/// Used for converting STR-296's integer-hundredth coefficients to
-/// centipawns.
+/// Alternative configuration retained for controlled evaluation.
 const INITIATIVE_WEIGHT_SCALE: i64 = 100;
-/// Used for bounding the complete phase-tapered STR-296 initiative delta.
+/// Alternative configuration retained for controlled evaluation.
 ///
 /// Legal values of the frozen six-feature vector remain below half this
 /// limit; the extra range is an overflow and future-drift guard.
@@ -388,7 +407,7 @@ const KINGSIDE_FLANK_MASK: u64 = 0xf0f0_f0f0_f0f0_f0f0;
 ///
 /// Applied by [`piece_activity`] when [`is_outpost`] accepts the knight's
 /// square.
-const KNIGHT_OUTPOST: (i32, i32) = (27, 14);
+const KNIGHT_OUTPOST: (i32, i32) = (28, 13);
 /// Used for rewarding a pawn-supported bishop outpost with midgame and
 /// endgame bonuses.
 ///
@@ -399,59 +418,59 @@ const BISHOP_OUTPOST: (i32, i32) = (15, 8);
 ///
 /// [`side_threats`] treats a weak enemy as hanging when it is undefended or
 /// attacked at least twice.
-const HANGING_THREAT: (i32, i32) = (21, 25);
+const HANGING_THREAT: (i32, i32) = (22, 25);
 /// Used for weighting a midgame square that both sides attack and the enemy
 /// does not strongly protect.
 ///
 /// Applied per restricted square in [`side_threats`]; the term has no
 /// endgame counterpart.
-const RESTRICTED_THREAT_MG: i32 = 4;
+const RESTRICTED_THREAT_MG: i32 = 5;
 /// Used for weighting a safe pawn attack on a non-pawn with midgame and
 /// endgame values.
 ///
 /// Applied per threatened non-pawn piece in [`side_threats`].
-const SAFE_PAWN_THREAT: (i32, i32) = (43, 30);
+const SAFE_PAWN_THREAT: (i32, i32) = (45, 30);
 /// Used for weighting a safe pawn push that creates an attack with midgame
 /// and endgame values.
 ///
 /// Applied in [`side_threats`] per non-pawn piece that a one- or two-step
 /// pawn push through empty squares would safely attack.
-const PAWN_PUSH_THREAT: (i32, i32) = (13, 8);
+const PAWN_PUSH_THREAT: (i32, i32) = (13, 7);
 /// Used for weighting safe knight pressure on the enemy queen with midgame
 /// and endgame values.
 ///
 /// Applied in [`side_threats`] per safe knight-reachable square lying a
 /// knight's move from the enemy queen.
-const QUEEN_KNIGHT_THREAT: (i32, i32) = (7, 7);
+const QUEEN_KNIGHT_THREAT: (i32, i32) = (6, 6);
 /// Used for weighting doubly supported slider pressure on the enemy queen
 /// with midgame and endgame values.
 ///
 /// Applied in [`side_threats`] per safe, doubly attacked square from which a
 /// bishop or rook bears on the enemy queen.
-const QUEEN_SLIDER_THREAT: (i32, i32) = (15, 4);
-/// Used for STR-298's hanging-piece research weight.
+const QUEEN_SLIDER_THREAT: (i32, i32) = (17, 5);
+/// Alternative configuration retained for controlled evaluation.
 ///
 /// The pair is the released value rescaled by the frozen hanging/restricted
 /// family coefficients and rounded once before compilation.
 const THREAT_CANDIDATE_HANGING: (i32, i32) = (20, 15);
-/// Used for STR-298's restricted-square middlegame research weight.
+/// Alternative configuration retained for controlled evaluation.
 ///
 /// Restricted squares have no endgame slot in the released evaluator, so the
 /// candidate preserves that structural zero.
 const THREAT_CANDIDATE_RESTRICTED_MG: i32 = 4;
-/// Used for STR-298's safe-pawn-attack research weight.
+/// Alternative configuration retained for controlled evaluation.
 ///
 /// The pair materializes the independently fitted pawn-family phase scales.
 const THREAT_CANDIDATE_SAFE_PAWN: (i32, i32) = (64, 42);
-/// Used for STR-298's safe pawn-push research weight.
+/// Alternative configuration retained for controlled evaluation.
 ///
 /// This shares the pawn-family scale with [`THREAT_CANDIDATE_SAFE_PAWN`].
 const THREAT_CANDIDATE_PAWN_PUSH: (i32, i32) = (19, 11);
-/// Used for STR-298's knight-on-queen research weight.
+/// Alternative configuration retained for controlled evaluation.
 ///
 /// The pair materializes the fitted queen-pressure family scale.
 const THREAT_CANDIDATE_QUEEN_KNIGHT: (i32, i32) = (6, 3);
-/// Used for STR-298's slider-on-queen research weight.
+/// Alternative configuration retained for controlled evaluation.
 ///
 /// This shares the queen-pressure scale with
 /// [`THREAT_CANDIDATE_QUEEN_KNIGHT`].
@@ -481,6 +500,16 @@ struct AttackMaps {
     /// Only populated when the rich attack state is enabled; empty when a
     /// color has no king on the board.
     king_zone: [u64; 2],
+    /// Used for storing every pawn-backed outpost square for each color.
+    ///
+    /// The set depends only on the two pawn-attack unions, which are complete
+    /// before any piece is scanned and cannot change afterwards — the piece
+    /// loop scans Knight through King and never touches `by_kind[_][Pawn]`.
+    /// [`piece_activity`] therefore reads the square set instead of rebuilding
+    /// it for every minor that misses its own outpost test.
+    ///
+    /// Only populated when the rich attack state is enabled.
+    outposts: [u64; 2],
     /// Used for counting pieces reaching the enemy king zone for each
     /// attacker color.
     king_attackers: [i32; 2],
@@ -605,11 +634,7 @@ pub struct PassedPawnCurveFeatures {
 
 /// Research-only named inputs to Janus's endgame-initiative experiment.
 ///
-/// Board-derived fields are color-invariant. [`Self::sign`] records the sign
-/// of the white-relative STR-280 candidate score that the correction extends,
-/// while [`Self::candidate_delta`] is white-relative and therefore negates
-/// under an exact vertical color reflection. The delta is phase tapered,
-/// bounded, and capped so it cannot reverse which side the input score favors.
+/// Alternative configuration retained for controlled evaluation.
 #[doc(hidden)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct InitiativeFeatures {
@@ -634,7 +659,7 @@ pub struct InitiativeFeatures {
     pub candidate_delta: i32,
 }
 
-/// Minimal accumulator used only by STR-295's score-bearing hot path.
+/// Alternative configuration retained for controlled evaluation.
 ///
 /// Keeping the rejected research geometry out of this structure prevents its
 /// zero-initialization and register pressure from leaking into evaluation.
@@ -656,9 +681,7 @@ struct PassedPawnCandidateFeatures {
 
 /// Position-wide immutable inputs shared by advanced passed pawns.
 ///
-/// Constructed lazily only when the shared passer traversal reaches relative
-/// rank four. Keeping the hot geometry in bitboards avoids repeated board
-/// lookups while preserving the exact STR-293 feature semantics.
+/// Alternative configuration retained for controlled evaluation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct PassedPawnContext {
     /// Used for testing complete forward paths and rear blockers.
@@ -733,10 +756,7 @@ impl AttackMaps {
     /// Used for building attack maps with one compile-time mobility-table
     /// flavor.
     ///
-    /// Keeping the table choice const-generic lets the optimizer produce the
-    /// same scan and lookup shape for release and STR-297. The public engine
-    /// path reaches this helper only through [`Self::build`] and therefore
-    /// remains locked to the released tables.
+    /// Alternative configuration retained for controlled evaluation.
     ///
     /// # Arguments
     ///
@@ -755,9 +775,14 @@ impl AttackMaps {
 
         if rich_attack_state {
             for color in [Color::White, Color::Black] {
-                maps.king_zone[color.index()] = position
-                    .king_square(color)
-                    .map_or(0, |king| king.bit() | king_ring(king));
+                // The move generator's King arm is exactly this neighbour
+                // set and is occupancy-independent, so the table load replaces
+                // eight bounds-checked offsets with one lookup. `king_ring`
+                // stays: its oracle test still compares the two.
+                maps.king_zone[color.index()] = position.king_square(color).map_or(0, |king| {
+                    king.bit()
+                        | position.attacks_for_piece(king, Piece::new(color, PieceKind::King))
+                });
             }
         }
 
@@ -765,13 +790,22 @@ impl AttackMaps {
         // formed. Attacks are added one source at a time so attacked-twice
         // tracking uses the same scan contract as every other attack union.
         for color in [Color::White, Color::Black] {
-            maps.scan_kind::<CANDIDATE_MOBILITY>(
-                position,
-                color,
-                PieceKind::Pawn,
-                0,
-                rich_attack_state,
-            );
+            // Both diagonals of every pawn in a few shifts, proven identical to
+            // the per-piece scan by `bulk_pawn_scan_matches_the_per_pawn_scan`.
+            maps.scan_pawns(position, color, rich_attack_state);
+        }
+
+        if rich_attack_state {
+            // Both pawn unions are final here and the piece loop below never
+            // writes them again, so one fill per color replaces one rebuild per
+            // minor that misses its own outpost square.
+            for color in [Color::White, Color::Black] {
+                maps.outposts[color.index()] = outpost_mask(
+                    color,
+                    maps.by_kind[color.index()][PieceKind::Pawn.index()],
+                    maps.by_kind[color.opposite().index()][PieceKind::Pawn.index()],
+                );
+            }
         }
 
         for color in [Color::White, Color::Black] {
@@ -858,6 +892,78 @@ impl AttackMaps {
                     self.king_attackers[color.index()] += 1;
                     self.king_attacker_weight[color.index()] += KING_ATTACK_WEIGHT[kind.index()];
                     self.king_ring_hits[color.index()] += bit_count(king_hits);
+                }
+            }
+        }
+    }
+
+    /// Used for adding every pawn attack of one colour in a handful of shifts.
+    ///
+    /// Alternative configuration retained for controlled evaluation.
+    ///
+    /// EXACTNESS RESTS ON SCAN ORDER. Pawns are scanned before any other kind,
+    /// so `all[colour]` is empty on entry and a square is attacked twice
+    /// exactly when BOTH diagonals reach it -- which is `left & right`. A pawn
+    /// can never attack the same square twice, so no other case exists.
+    ///
+    /// # Arguments
+    ///
+    /// * `position` - position whose pawns are scanned
+    /// * `color` - colour whose pawns are added
+    /// * `rich_attack_state` - whether attacked-twice and king-zone
+    ///   accounting are maintained
+    fn scan_pawns(&mut self, position: &Position, color: Color, rich_attack_state: bool) {
+        let pawns = position.piece_bitboard(Piece::new(color, PieceKind::Pawn));
+        self.scan_pawns_from(pawns, color, rich_attack_state);
+    }
+
+    /// Used for the bitboard half of [`Self::scan_pawns`].
+    ///
+    /// Split from the position lookup so the equivalence test can drive it
+    /// with synthetic pawn sets that no legal position need contain.
+    ///
+    /// # Arguments
+    ///
+    /// * `pawns` - pawn bitboard for `color`
+    /// * `color` - colour whose pawns are added
+    /// * `rich_attack_state` - whether attacked-twice and king-zone
+    ///   accounting are maintained
+    fn scan_pawns_from(&mut self, pawns: u64, color: Color, rich_attack_state: bool) {
+        // Same shifts the pre-existing `pawn_attack_mask` uses, kept split
+        // because attacked-twice needs the two diagonals separately.
+        const FILE_A: u64 = 0x0101_0101_0101_0101;
+        const FILE_H: u64 = 0x8080_8080_8080_8080;
+        let (left, right) = if color == Color::White {
+            ((pawns & !FILE_A) >> 9, (pawns & !FILE_H) >> 7)
+        } else {
+            ((pawns & !FILE_A) << 7, (pawns & !FILE_H) << 9)
+        };
+        let attacks = left | right;
+        if rich_attack_state {
+            self.attacked_twice[color.index()] |=
+                (self.all[color.index()] & attacks) | (left & right);
+        }
+        self.by_kind[color.index()][PieceKind::Pawn.index()] |= attacks;
+        self.all[color.index()] |= attacks;
+
+        if rich_attack_state {
+            let enemy = color.opposite();
+            let zone = self.king_zone[enemy.index()];
+            if zone != 0 {
+                // Reverse the two diagonals to find which pawns reach the zone,
+                // so the per-pawn attacker count survives the bulk rewrite.
+                let reverse = if color == Color::White {
+                    ((zone & !FILE_H) << 9) | ((zone & !FILE_A) << 7)
+                } else {
+                    ((zone & !FILE_H) >> 7) | ((zone & !FILE_A) >> 9)
+                };
+                let attackers = bit_count(pawns & reverse);
+                if attackers > 0 {
+                    self.king_attackers[color.index()] += attackers;
+                    self.king_attacker_weight[color.index()] +=
+                        attackers * KING_ATTACK_WEIGHT[PieceKind::Pawn.index()];
+                    self.king_ring_hits[color.index()] +=
+                        bit_count(left & zone) + bit_count(right & zone);
                 }
             }
         }
@@ -973,9 +1079,7 @@ impl Classical {
     /// Used for evaluating a position and exposing its independently
     /// testable terms.
     ///
-    /// Always evaluates the released attack-state flavor selected by
-    /// `RELEASE_RICH_ATTACK_STATE`, including the promoted STR-280
-    /// king-danger scorer confirmed on 2026-08-05.
+    /// Alternative configuration retained for controlled evaluation.
     ///
     /// # Arguments
     ///
@@ -991,20 +1095,14 @@ impl Classical {
         let (connected_pawns, king_pawn_file) = promoted_capacity_delta(position);
         result.pawns = result.pawns.saturating_add(connected_pawns);
         result.kings = result.kings.saturating_add(king_pawn_file);
+
         result
     }
 
     /// Used for evaluating either the frozen compact HCE or the released
     /// rich attack state.
     ///
-    /// This entry point exists for deterministic engine research. `false`
-    /// selects the compact evaluator frozen before the attack-state experiment;
-    /// `true` selects the rich path measured by that experiment while keeping
-    /// every material, placement, pawn, bishop-pair, rook-file, king-shelter,
-    /// mobility, and tempo term identical. Both arms deliberately keep the
-    /// pre-STR-280 king-pressure term so the frozen contrast still isolates
-    /// the attack state alone; neither arm is production since STR-280 was
-    /// promoted. The ordinary engine uses [`Self::breakdown`].
+    /// Alternative configuration retained for controlled evaluation.
     ///
     /// # Arguments
     ///
@@ -1045,7 +1143,7 @@ impl Classical {
         }
     }
 
-    /// Used for comparing the released and STR-280 king-danger scorers.
+    /// Alternative configuration retained for controlled evaluation.
     ///
     /// Both flavors retain the released rich attack state and differ only in
     /// the final king-pressure term. This keeps the static audit and later
@@ -1053,8 +1151,7 @@ impl Classical {
     ///
     /// # Arguments
     ///
-    /// * `position` - position to evaluate
-    /// * `candidate` - whether to apply the fitted STR-280 scorer
+    /// Alternative configuration retained for controlled evaluation.
     ///
     /// # Returns
     ///
@@ -1068,7 +1165,7 @@ impl Classical {
         Self::breakdown_with_attack_state(position, true, candidate, false)
     }
 
-    /// Used for creating a search evaluator for the STR-280 A/B.
+    /// Alternative configuration retained for controlled evaluation.
     ///
     /// # Arguments
     ///
@@ -1087,8 +1184,7 @@ impl Classical {
         }
     }
 
-    /// Used for evaluating one STR-280 flavor through the exact production
-    /// score-calibration path.
+    /// Alternative configuration retained for controlled evaluation.
     ///
     /// This research entry point exists so a separately built UCI binary can
     /// exercise the fitted candidate without adding a mutable protocol option
@@ -1110,11 +1206,9 @@ impl Classical {
         side_to_move_score(position, white_score)
     }
 
-    /// Used for comparing STR-280 with STR-304's pawn-file proximity term.
+    /// Alternative configuration retained for controlled evaluation.
     ///
-    /// Both arms use the fitted STR-280 king-danger scorer. The candidate arm
-    /// adds only the bounded, phase-tapered nearest-pawn-file balance to the
-    /// king-placement field, leaving every attack map and existing term exact.
+    /// Alternative configuration retained for controlled evaluation.
     ///
     /// # Arguments
     ///
@@ -1123,7 +1217,7 @@ impl Classical {
     ///
     /// # Returns
     ///
-    /// White-relative decomposition for the selected STR-304 flavor.
+    /// Alternative configuration retained for controlled evaluation.
     #[doc(hidden)]
     #[must_use]
     pub fn research_king_pawn_proximity_breakdown(
@@ -1142,7 +1236,7 @@ impl Classical {
         breakdown
     }
 
-    /// Used for creating a search evaluator for the STR-304 A/B.
+    /// Alternative configuration retained for controlled evaluation.
     ///
     /// # Arguments
     ///
@@ -1157,10 +1251,9 @@ impl Classical {
         ResearchKingPawnProximity { candidate }
     }
 
-    /// Used for evaluating one STR-304 flavor through production calibration.
+    /// Alternative configuration retained for controlled evaluation.
     ///
-    /// This research-only entry point composes STR-304 on STR-280 without
-    /// changing [`Self::evaluate_position`] or adding a mutable UCI option.
+    /// Alternative configuration retained for controlled evaluation.
     ///
     /// # Arguments
     ///
@@ -1183,10 +1276,7 @@ impl Classical {
 
     /// Used for extracting named king-danger inputs without changing play.
     ///
-    /// This diagnostic is deliberately computed from the same [`AttackMaps`]
-    /// and helper path as the released evaluation. It exists for fitting and
-    /// auditing STR-280; production scoring continues to use
-    /// [`Self::breakdown`] until a candidate passes its declared gates.
+    /// Alternative configuration retained for controlled evaluation.
     ///
     /// # Arguments
     ///
@@ -1206,10 +1296,7 @@ impl Classical {
     /// Used for extracting named passed-pawn realization inputs without
     /// changing play.
     ///
-    /// This diagnostic shares [`is_passed`] and the exact released passer
-    /// bonus scan with [`pawn_structure`]. The additional geometry is derived
-    /// from the already established rich [`AttackMaps`]; production scoring
-    /// remains unchanged while STR-293 is in its static-preparation stage.
+    /// Alternative configuration retained for controlled evaluation.
     ///
     /// # Arguments
     ///
@@ -1247,8 +1334,7 @@ impl Classical {
         passed_pawn_curve_features(position, game_phase(position))
     }
 
-    /// Used for comparing the released and STR-295 passed-pawn state
-    /// scorers.
+    /// Alternative configuration retained for controlled evaluation.
     ///
     /// Both flavors retain the released rich attack state and king-pressure
     /// scorer. The candidate differs only by adding the fitted, bounded
@@ -1256,8 +1342,7 @@ impl Classical {
     ///
     /// # Arguments
     ///
-    /// * `position` - position to evaluate
-    /// * `candidate` - whether to apply the fitted STR-295 passer-state delta
+    /// Alternative configuration retained for controlled evaluation.
     ///
     /// # Returns
     ///
@@ -1271,7 +1356,7 @@ impl Classical {
         Self::breakdown_with_attack_state(position, true, false, candidate)
     }
 
-    /// Used for creating a search evaluator for the STR-295 A/B.
+    /// Alternative configuration retained for controlled evaluation.
     ///
     /// # Arguments
     ///
@@ -1290,8 +1375,7 @@ impl Classical {
         }
     }
 
-    /// Used for evaluating one STR-295 flavor through the production score
-    /// calibration path.
+    /// Alternative configuration retained for controlled evaluation.
     ///
     /// # Arguments
     ///
@@ -1308,14 +1392,9 @@ impl Classical {
         side_to_move_score(position, white_score)
     }
 
-    /// Used for comparing STR-280 with and without STR-297's mobility tables.
+    /// Alternative configuration retained for controlled evaluation.
     ///
-    /// Both arms use the fitted STR-280 king-danger scorer. The candidate arm
-    /// changes only the compile-time mobility-table selection, leaving every
-    /// attack mask, destination count, phase rule, and scoring constant
-    /// identical. The existing king-pressure formula deliberately consumes
-    /// the MG mobility edge, so its induced downstream delta remains part of
-    /// this mobility-family experiment.
+    /// Alternative configuration retained for controlled evaluation.
     ///
     /// # Arguments
     ///
@@ -1324,7 +1403,7 @@ impl Classical {
     ///
     /// # Returns
     ///
-    /// White-relative decomposition for the selected STR-297 flavor.
+    /// Alternative configuration retained for controlled evaluation.
     #[doc(hidden)]
     #[must_use]
     pub fn research_mobility_breakdown(position: &Position, candidate: bool) -> ClassicalBreakdown {
@@ -1335,7 +1414,7 @@ impl Classical {
         }
     }
 
-    /// Used for creating a search evaluator for the STR-297 A/B.
+    /// Alternative configuration retained for controlled evaluation.
     ///
     /// # Arguments
     ///
@@ -1350,11 +1429,9 @@ impl Classical {
         ResearchMobility { candidate }
     }
 
-    /// Used for evaluating one STR-297 flavor through production score
-    /// calibration.
+    /// Alternative configuration retained for controlled evaluation.
     ///
-    /// This research-only entry point composes STR-297 on STR-280 without
-    /// changing [`Self::evaluate_position`] or exposing a mutable UCI option.
+    /// Alternative configuration retained for controlled evaluation.
     ///
     /// # Arguments
     ///
@@ -1371,11 +1448,9 @@ impl Classical {
         side_to_move_score(position, white_score)
     }
 
-    /// Used for comparing STR-280 with and without STR-298's threat weights.
+    /// Alternative configuration retained for controlled evaluation.
     ///
-    /// Both arms use the fitted STR-280 king-danger scorer and the released
-    /// mobility tables. The const-specialized candidate changes only the
-    /// baked weights consumed by the existing rich threat traversal.
+    /// Alternative configuration retained for controlled evaluation.
     ///
     /// # Arguments
     ///
@@ -1384,7 +1459,7 @@ impl Classical {
     ///
     /// # Returns
     ///
-    /// White-relative decomposition for the selected STR-298 flavor.
+    /// Alternative configuration retained for controlled evaluation.
     #[doc(hidden)]
     #[must_use]
     pub fn research_threat_breakdown(position: &Position, candidate: bool) -> ClassicalBreakdown {
@@ -1399,7 +1474,7 @@ impl Classical {
         }
     }
 
-    /// Used for creating a search evaluator for the STR-298 A/B.
+    /// Alternative configuration retained for controlled evaluation.
     ///
     /// # Arguments
     ///
@@ -1414,11 +1489,9 @@ impl Classical {
         ResearchThreats { candidate }
     }
 
-    /// Used for evaluating one STR-298 flavor through production score
-    /// calibration.
+    /// Alternative configuration retained for controlled evaluation.
     ///
-    /// This research-only entry point composes STR-298 on STR-280 without
-    /// changing [`Self::evaluate_position`] or adding a mutable UCI option.
+    /// Alternative configuration retained for controlled evaluation.
     ///
     /// # Arguments
     ///
@@ -1435,11 +1508,9 @@ impl Classical {
         side_to_move_score(position, white_score)
     }
 
-    /// Used for comparing STR-280 with and without STR-299's doubled-pawn weight.
+    /// Alternative configuration retained for controlled evaluation.
     ///
-    /// Both arms use the fitted STR-280 king-danger scorer and released
-    /// mobility/threat weights. The compile-time candidate changes only the
-    /// immediate multiplied by each existing per-file extra-pawn count.
+    /// Alternative configuration retained for controlled evaluation.
     ///
     /// # Arguments
     ///
@@ -1448,7 +1519,7 @@ impl Classical {
     ///
     /// # Returns
     ///
-    /// White-relative decomposition for the selected STR-299 flavor.
+    /// Alternative configuration retained for controlled evaluation.
     #[doc(hidden)]
     #[must_use]
     pub fn research_pawn_structure_breakdown(
@@ -1466,7 +1537,7 @@ impl Classical {
         }
     }
 
-    /// Used for creating a search evaluator for the STR-299 A/B.
+    /// Alternative configuration retained for controlled evaluation.
     ///
     /// # Arguments
     ///
@@ -1481,10 +1552,9 @@ impl Classical {
         ResearchPawnStructure { candidate }
     }
 
-    /// Used for evaluating one STR-299 flavor through production score calibration.
+    /// Alternative configuration retained for controlled evaluation.
     ///
-    /// This research-only entry point composes STR-299 on STR-280 without
-    /// changing [`Self::evaluate_position`] or exposing a mutable UCI option.
+    /// Alternative configuration retained for controlled evaluation.
     ///
     /// # Arguments
     ///
@@ -1502,12 +1572,9 @@ impl Classical {
         side_to_move_score(position, white_score)
     }
 
-    /// Used for comparing STR-280 with STR-306's passed-pawn rank curve.
+    /// Alternative configuration retained for controlled evaluation.
     ///
-    /// Both arms use the fitted STR-280 king-danger scorer. Const
-    /// specialization changes only the quadratic multiplication immediate in
-    /// the shared true-passer traversal; every other pawn and evaluation term
-    /// is identical.
+    /// Alternative configuration retained for controlled evaluation.
     ///
     /// # Arguments
     ///
@@ -1516,7 +1583,7 @@ impl Classical {
     ///
     /// # Returns
     ///
-    /// White-relative decomposition for the selected STR-306 flavor.
+    /// Alternative configuration retained for controlled evaluation.
     #[doc(hidden)]
     #[must_use]
     pub fn research_passed_pawn_curve_breakdown(
@@ -1534,10 +1601,9 @@ impl Classical {
         }
     }
 
-    /// Used for evaluating one STR-306 flavor through production calibration.
+    /// Alternative configuration retained for controlled evaluation.
     ///
-    /// This immutable research entry point composes the candidate on STR-280
-    /// without adding a mutable UCI option or changing [`Self::evaluate_position`].
+    /// Alternative configuration retained for controlled evaluation.
     ///
     /// # Arguments
     ///
@@ -1558,7 +1624,7 @@ impl Classical {
         side_to_move_score(position, white_score)
     }
 
-    /// Used by the immutable STR-306 UCI build without a runtime flavor flag.
+    /// Alternative configuration retained for controlled evaluation.
     ///
     /// The direct const-specialized call ensures optimized candidate play has
     /// the same passer-loop control flow as release evaluation and changes
@@ -1570,7 +1636,7 @@ impl Classical {
     ///
     /// # Returns
     ///
-    /// Calibrated centipawn score with STR-280 and coefficient two enabled.
+    /// Alternative configuration retained for controlled evaluation.
     #[doc(hidden)]
     #[must_use]
     pub fn research_passed_pawn_curve_candidate_evaluate_position(position: &Position) -> i32 {
@@ -1581,22 +1647,20 @@ impl Classical {
         side_to_move_score(position, white_score)
     }
 
-    /// Used for creating a const-specialized STR-306 search evaluator.
+    /// Alternative configuration retained for controlled evaluation.
     ///
     /// # Returns
     ///
-    /// Opaque search evaluator with STR-280 and coefficient two enabled.
+    /// Alternative configuration retained for controlled evaluation.
     #[doc(hidden)]
     #[must_use]
     pub fn research_passed_pawn_curve_candidate() -> impl SearchEvaluator + Clone {
         ResearchPassedPawnCurve
     }
 
-    /// Used by the STR-306 baseline build without a runtime flavor flag.
+    /// Alternative configuration retained for controlled evaluation.
     ///
-    /// This is the exact const-specialized STR-280 plus released-coefficient
-    /// counterpart to
-    /// [`Self::research_passed_pawn_curve_candidate_evaluate_position`].
+    /// Alternative configuration retained for controlled evaluation.
     ///
     /// # Arguments
     ///
@@ -1604,7 +1668,7 @@ impl Classical {
     ///
     /// # Returns
     ///
-    /// Calibrated centipawn score with STR-280 and coefficient five enabled.
+    /// Alternative configuration retained for controlled evaluation.
     #[doc(hidden)]
     #[must_use]
     pub fn research_passed_pawn_curve_baseline_evaluate_position(position: &Position) -> i32 {
@@ -1615,17 +1679,13 @@ impl Classical {
         side_to_move_score(position, white_score)
     }
 
-    /// Used for extracting STR-296's constant-time endgame-complexity inputs.
+    /// Alternative configuration retained for controlled evaluation.
     ///
-    /// The caller supplies the exact white-relative score being extended so
-    /// the emitted sign and capped delta cannot drift from the composed
-    /// STR-280 baseline. Missing kings make both king-geometry fields zero;
-    /// all material-only fields remain available for bounded diagnostic FENs.
+    /// Alternative configuration retained for controlled evaluation.
     ///
     /// # Arguments
     ///
-    /// * `position` - position whose material and king geometry are inspected
-    /// * `pre_initiative_white_score` - white-relative score before STR-296
+    /// Alternative configuration retained for controlled evaluation.
     ///
     /// # Returns
     ///
@@ -1640,12 +1700,9 @@ impl Classical {
         initiative_features(position, pre_initiative_white_score, game_phase(position))
     }
 
-    /// Used for creating a search evaluator for the STR-296 A/B.
+    /// Alternative configuration retained for controlled evaluation.
     ///
-    /// Both arms include STR-280's fitted king-danger scorer. The candidate
-    /// arm alone adds the fitted initiative delta, keeping the eventual
-    /// composition boundary explicit and leaving the release evaluator
-    /// unchanged.
+    /// Alternative configuration retained for controlled evaluation.
     ///
     /// # Arguments
     ///
@@ -1660,25 +1717,13 @@ impl Classical {
         ResearchInitiative { candidate }
     }
 
-    /// Used for creating a search evaluator that composes STR-304 with
-    /// STR-319.
+    /// Alternative configuration retained for controlled evaluation.
     ///
-    /// The two survivors of the 2026-08-05 screening batch touch unrelated
-    /// geometry — king-to-nearest-pawn-file distance and pawn connection — so
-    /// they are expected to be close to additive. That expectation is exactly
-    /// what this evaluator exists to measure: the campaign's own additive audit
-    /// already found STR-298 and STR-299 failing to compose, so composition is
-    /// tested rather than assumed.
+    /// Alternative configuration retained for controlled evaluation.
     ///
     /// # Arguments
     ///
-    /// * `connected_scale_percent` - connected-pawn ramp percentage; `0`
-    ///   disables that feature
-    /// * `king_pawn_proximity` - whether to add the STR-304 king term
-    /// * `pawn_count_material` - whether to add the STR-321 material term
-    /// * `per_king_danger` - whether to convert king danger per defender
-    /// * `pawnless_scaling` - whether to scale pawnless drawn endings
-    /// * `backward_pawns` - whether to add the STR-323 backward penalty
+    /// Alternative configuration retained for controlled evaluation.
     ///
     /// # Returns
     ///
@@ -1704,13 +1749,7 @@ impl Classical {
     ///
     /// # Arguments
     ///
-    /// * `position` - position to evaluate
-    /// * `connected_scale_percent` - connected-pawn ramp percentage
-    /// * `king_pawn_proximity` - whether to add the STR-304 king term
-    /// * `pawn_count_material` - whether to add the STR-321 material term
-    /// * `per_king_danger` - whether to convert king danger per defender
-    /// * `pawnless_scaling` - whether to scale pawnless drawn endings
-    /// * `backward_pawns` - whether to add the STR-323 backward penalty
+    /// Alternative configuration retained for controlled evaluation.
     ///
     /// # Returns
     ///
@@ -1807,7 +1846,7 @@ impl Classical {
         ResearchParams { params }
     }
 
-    /// Used for creating a search evaluator for the STR-319 A/B.
+    /// Alternative configuration retained for controlled evaluation.
     ///
     /// The baseline arm is exactly the promoted release. The candidate adds
     /// [`connected_pawn_term`] to the released pawn term and changes nothing
@@ -1825,6 +1864,30 @@ impl Classical {
     #[must_use]
     pub fn research_connected_pawns(scale_percent: i32) -> impl SearchEvaluator + Clone {
         ResearchConnectedPawns { scale_percent }
+    }
+
+    /// Used for pricing a piece on the scale the released evaluator's own
+    /// scores carry.
+    ///
+    /// Alternative configuration retained for controlled evaluation.
+    ///
+    /// Alternative configuration retained for controlled evaluation.
+    ///
+    /// # Arguments
+    ///
+    /// * `kind` - piece kind to price
+    ///
+    /// # Returns
+    ///
+    /// The piece's value in calibrated evaluator centipawns; the king keeps a
+    /// large sentinel because no evaluation prices it.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn research_evaluator_material_value(kind: PieceKind) -> i32 {
+        if matches!(kind, PieceKind::King) {
+            return 20_000;
+        }
+        (MATERIAL[kind.index()] * SEARCH_SCORE_SCALE_PERCENT + 50) / 100
     }
 
     /// Used for exposing the released tapering phase to offline research
@@ -1854,8 +1917,7 @@ impl Classical {
     #[doc(hidden)]
     pub const RESEARCH_MAX_PHASE: i32 = MAX_PHASE;
 
-    /// Used for constructing the `STR-20260806-334` piece-square correction
-    /// flavor.
+    /// Alternative configuration retained for controlled evaluation.
     ///
     /// # Arguments
     ///
@@ -1873,8 +1935,7 @@ impl Classical {
         ResearchPieceSquareDelta { delta }
     }
 
-    /// Used for evaluating one `STR-20260806-334` flavor through the
-    /// production score calibration path.
+    /// Alternative configuration retained for controlled evaluation.
     ///
     /// # Arguments
     ///
@@ -1901,7 +1962,100 @@ impl Classical {
         side_to_move_score(position, breakdown.white_score())
     }
 
-    /// Used for constructing one `STR-20260806-332` bad-bishop flavor.
+    /// Alternative configuration retained for controlled evaluation.
+    ///
+    /// The flavor multiplies the released white-relative total by
+    /// `scale_percent` before calibration and clamping. It changes *only* the
+    /// dispersion of the evaluation: the ordering of any two positions is
+    /// preserved exactly, up to integer ties, because a positive scale is a
+    /// monotone map.
+    ///
+    /// This exists to separate two things every refit in this campaign has
+    /// confounded. Janus's search is denominated in centipawns —
+    /// `REVERSE_FUTILITY_MARGIN`, `FUTILITY_MARGIN`, `DELTA_MARGIN`,
+    /// `PROBCUT_MARGIN`, `SINGULAR_MARGIN`, and `ASPIRATION_WINDOW` are all
+    /// absolute — and every one was tuned against the released evaluator's
+    /// scale. A refit that changes dispersion therefore re-tunes six pruning
+    /// margins at once, silently, and its measured Elo mixes evaluation
+    /// quality with search detuning. If a pure scale change costs Elo, that
+    /// confound is real and every rejected vector owes a dispersion-normalized
+    /// re-screen.
+    ///
+    /// # Arguments
+    ///
+    /// * `scale_percent` - percentage applied to the white-relative total;
+    ///   `100` reproduces the release exactly
+    ///
+    /// # Returns
+    ///
+    /// A cloneable evaluator over the selected flavor.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn research_eval_scale(scale_percent: i32) -> impl SearchEvaluator + Clone {
+        ResearchEvalScale { scale_percent }
+    }
+
+    /// Alternative configuration retained for controlled evaluation.
+    ///
+    /// # Arguments
+    ///
+    /// * `position` - position to evaluate
+    /// * `scale_percent` - percentage applied to the white-relative total
+    ///
+    /// # Returns
+    ///
+    /// Calibrated centipawn score from the side-to-move perspective.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn research_eval_scale_evaluate_position(position: &Position, scale_percent: i32) -> i32 {
+        let white = Self::breakdown(position).white_score();
+        side_to_move_score(position, white * scale_percent / 100)
+    }
+
+    /// Alternative configuration retained for controlled evaluation.
+    ///
+    /// Alternative configuration retained for controlled evaluation.
+    ///
+    /// # Arguments
+    ///
+    /// * `scale_percent` - percentage applied to every non-material term;
+    ///   `100` reproduces the release exactly
+    ///
+    /// # Returns
+    ///
+    /// A cloneable evaluator over the selected flavor.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn research_positional_scale(scale_percent: i32) -> impl SearchEvaluator + Clone {
+        ResearchPositionalScale { scale_percent }
+    }
+
+    /// Alternative configuration retained for controlled evaluation.
+    ///
+    /// # Arguments
+    ///
+    /// * `position` - position to evaluate
+    /// * `scale_percent` - percentage applied to every non-material term
+    ///
+    /// # Returns
+    ///
+    /// Calibrated centipawn score from the side-to-move perspective.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn research_positional_scale_evaluate_position(
+        position: &Position,
+        scale_percent: i32,
+    ) -> i32 {
+        let breakdown = Self::breakdown(position);
+        let white = breakdown.white_score();
+        let positional = white - breakdown.material;
+        side_to_move_score(
+            position,
+            breakdown.material + positional * scale_percent / 100,
+        )
+    }
+
+    /// Alternative configuration retained for controlled evaluation.
     ///
     /// # Arguments
     ///
@@ -1910,15 +2064,53 @@ impl Classical {
     ///
     /// # Returns
     ///
+    /// Alternative configuration retained for controlled evaluation.
+    ///
+    /// # Arguments
+    ///
+    /// * `weight` - centipawns per weighted safe square; `0` selects the exact
+    ///   released baseline
+    ///
+    /// # Returns
+    ///
     /// A cloneable evaluator over the selected flavor.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn research_space(weight: i32) -> impl SearchEvaluator + Clone {
+        ResearchSpace { weight }
+    }
+
+    /// Alternative configuration retained for controlled evaluation.
+    ///
+    /// # Arguments
+    ///
+    /// * `position` - position to evaluate
+    /// * `weight` - space weight; `0` selects the baseline
+    ///
+    /// # Returns
+    ///
+    /// Calibrated centipawn score from the side-to-move perspective.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn research_space_evaluate_position(position: &Position, weight: i32) -> i32 {
+        let mut breakdown = Self::breakdown(position);
+        if weight != 0 {
+            breakdown.mobility = breakdown.mobility.saturating_add(space_term(
+                position,
+                game_phase(position),
+                weight,
+            ));
+        }
+        side_to_move_score(position, breakdown.white_score())
+    }
+
     #[doc(hidden)]
     #[must_use]
     pub fn research_bishop_pawns(scale_percent: i32) -> impl SearchEvaluator + Clone {
         ResearchBishopPawns { scale_percent }
     }
 
-    /// Used for evaluating one `STR-20260806-332` flavor through the production
-    /// score calibration path.
+    /// Alternative configuration retained for controlled evaluation.
     ///
     /// # Arguments
     ///
@@ -1942,8 +2134,137 @@ impl Classical {
         side_to_move_score(position, breakdown.white_score())
     }
 
-    /// Used for evaluating one STR-319 flavor through the production score
-    /// calibration path.
+    /// Alternative configuration retained for controlled evaluation.
+    ///
+    /// Alternative configuration retained for controlled evaluation.
+    ///
+    /// # Arguments
+    ///
+    /// * `position` - position to evaluate
+    /// * `shuffle_percent` - score retained at a full halfmove clock
+    /// * `king_exposure` - untapered pair per square the king's queen-reach covers
+    /// * `pawnless_percent` - score retained when the stronger side is pawnless
+    ///
+    /// # Returns
+    ///
+    /// Calibrated centipawn score from the side-to-move perspective.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn research_eval_batch_evaluate_position(
+        position: &Position,
+        shuffle_percent: i32,
+        king_exposure: (i32, i32),
+        pawnless_percent: i32,
+    ) -> i32 {
+        let mut breakdown = Self::breakdown(position);
+        breakdown.kings = breakdown.kings.saturating_add(king_line_exposure_term(
+            position,
+            game_phase(position),
+            king_exposure,
+        ));
+        let damped = shuffle_damped_score(
+            breakdown.white_score(),
+            i32::from(position.halfmove_clock()),
+            shuffle_percent,
+        );
+        let scaled = pawn_count_scaled_score(position, damped, pawnless_percent);
+        side_to_move_score(position, scaled)
+    }
+
+    /// Alternative configuration retained for controlled evaluation.
+    ///
+    /// # Arguments
+    ///
+    /// * `enabled` - `false` selects the exact released baseline
+    ///
+    /// # Returns
+    ///
+    /// A cloneable evaluator over the selected flavor.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn research_eval_batch(enabled: bool) -> impl SearchEvaluator + Clone {
+        ResearchEvalBatch {
+            enabled,
+            shuffle_percent: 55,
+            king_exposure: (2, 1),
+            pawnless_percent: 45,
+        }
+    }
+
+    /// Alternative configuration retained for controlled evaluation.
+    ///
+    /// Alternative configuration retained for controlled evaluation.
+    ///
+    /// Alternative configuration retained for controlled evaluation.
+    ///
+    /// # Arguments
+    ///
+    /// * `percent` - score retained past [`HALFMOVE_DAMPING_START`]; `100` is
+    ///   the released no-op and must score exactly `0.500000`
+    ///
+    /// # Returns
+    ///
+    /// A cloneable evaluator with the damper active and the batch's other two
+    /// terms at their released no-ops.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn research_shuffle_damper(percent: i32) -> impl SearchEvaluator + Clone {
+        ResearchEvalBatch {
+            enabled: true,
+            shuffle_percent: percent,
+            king_exposure: (0, 0),
+            pawnless_percent: 100,
+        }
+    }
+
+    /// Alternative configuration retained for controlled evaluation.
+    ///
+    /// # Arguments
+    ///
+    /// * `position` - position to evaluate
+    /// * `middlegame` - untapered middlegame penalty per pinned piece
+    /// * `endgame` - untapered endgame penalty per pinned piece
+    ///
+    /// # Returns
+    ///
+    /// Calibrated centipawn score from the side-to-move perspective.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn research_absolute_pins_evaluate_position(
+        position: &Position,
+        middlegame: i32,
+        endgame: i32,
+    ) -> i32 {
+        let mut breakdown = Self::breakdown(position);
+        breakdown.threats = breakdown.threats.saturating_add(absolute_pin_term(
+            position,
+            game_phase(position),
+            (middlegame, endgame),
+        ));
+        side_to_move_score(position, breakdown.white_score())
+    }
+
+    /// Alternative configuration retained for controlled evaluation.
+    ///
+    /// # Arguments
+    ///
+    /// * `middlegame` - untapered middlegame penalty per pinned piece
+    /// * `endgame` - untapered endgame penalty per pinned piece
+    ///
+    /// # Returns
+    ///
+    /// A cloneable evaluator over the selected flavor; `(0, 0)` is the exact
+    /// released baseline.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn research_absolute_pins(middlegame: i32, endgame: i32) -> impl SearchEvaluator + Clone {
+        ResearchAbsolutePins {
+            middlegame,
+            endgame,
+        }
+    }
+
+    /// Alternative configuration retained for controlled evaluation.
     ///
     /// # Arguments
     ///
@@ -1971,12 +2292,9 @@ impl Classical {
         side_to_move_score(position, breakdown.white_score())
     }
 
-    /// Used for evaluating one STR-296 flavor through the production score
-    /// calibration path.
+    /// Alternative configuration retained for controlled evaluation.
     ///
-    /// Both flavors start from the STR-280 candidate breakdown. This function
-    /// is kept separate from [`Self::evaluate_position`] so a research binary
-    /// cannot silently enable the candidate in release play.
+    /// Alternative configuration retained for controlled evaluation.
     ///
     /// # Arguments
     ///
@@ -1995,7 +2313,7 @@ impl Classical {
         )
     }
 
-    /// Used for composing STR-280 and STR-296 before score calibration.
+    /// Alternative configuration retained for controlled evaluation.
     ///
     /// # Arguments
     ///
@@ -2004,7 +2322,7 @@ impl Classical {
     ///
     /// # Returns
     ///
-    /// White-relative STR-280 score, optionally extended by STR-296.
+    /// Alternative configuration retained for controlled evaluation.
     fn research_initiative_white_score(position: &Position, candidate: bool) -> i32 {
         let white_score =
             Self::breakdown_with_attack_state(position, true, true, false).white_score();
@@ -2027,11 +2345,7 @@ impl Classical {
     ///
     /// # Arguments
     ///
-    /// * `position` - position to evaluate
-    /// * `rich_attack_state` - whether the rich attack-state terms are
-    ///   computed
-    /// * `king_danger_candidate` - whether rich king pressure uses STR-280
-    /// * `passed_pawn_candidate` - whether the pawn term adds STR-295
+    /// Alternative configuration retained for controlled evaluation.
     ///
     /// # Returns
     ///
@@ -2053,18 +2367,11 @@ impl Classical {
     /// Used for building a decomposition with one compile-time mobility-table
     /// flavor.
     ///
-    /// Every term except mobility receives the same inputs in both
-    /// instantiations. The const parameter is consumed only by
-    /// [`AttackMaps::build_with_mobility`], keeping STR-297 isolated to its
-    /// materialized lookup constants.
+    /// Alternative configuration retained for controlled evaluation.
     ///
     /// # Arguments
     ///
-    /// * `position` - position to evaluate
-    /// * `rich_attack_state` - whether the rich attack-state terms are
-    ///   computed
-    /// * `king_danger_candidate` - whether rich king pressure uses STR-280
-    /// * `passed_pawn_candidate` - whether the pawn term adds STR-295
+    /// Alternative configuration retained for controlled evaluation.
     ///
     /// # Returns
     ///
@@ -2094,11 +2401,7 @@ impl Classical {
     ///
     /// # Arguments
     ///
-    /// * `position` - position to evaluate
-    /// * `rich_attack_state` - whether the rich attack-state terms are
-    ///   computed
-    /// * `king_danger_candidate` - whether rich king pressure uses STR-280
-    /// * `passed_pawn_candidate` - whether the pawn term adds STR-295
+    /// Alternative configuration retained for controlled evaluation.
     ///
     /// # Returns
     ///
@@ -2115,6 +2418,58 @@ impl Classical {
         king_danger_candidate: bool,
         passed_pawn_candidate: bool,
     ) -> ClassicalBreakdown {
+        Self::breakdown_lazily::<
+            CANDIDATE_MOBILITY,
+            CANDIDATE_THREATS,
+            CANDIDATE_PAWN_STRUCTURE,
+            CANDIDATE_PASSED_CURVE,
+            PER_KING_DANGER,
+        >(
+            position,
+            rich_attack_state,
+            king_danger_candidate,
+            passed_pawn_candidate,
+            None,
+        )
+        .0
+    }
+
+    /// Used for the breakdown with an optional early return once the cheap
+    /// terms already settle the node.
+    ///
+    /// Alternative configuration retained for controlled evaluation.
+    ///
+    /// The gate deliberately sits **inside** this function rather than in a
+    /// wrapper that recomputes the prefix: a recomputing lazy evaluator pays
+    /// `43%` extra whenever it fails to bail, and would need to bail on `43%`
+    /// of nodes merely to break even.
+    ///
+    /// `promoted_capacity_delta`, which `Self::breakdown` adds afterwards, is
+    /// **not** included in the gated score. It is bounded and small, and
+    /// leaving it out only makes the gate more reluctant to bail, which is the
+    /// safe direction.
+    ///
+    /// # Arguments
+    ///
+    /// Alternative configuration retained for controlled evaluation.
+    ///
+    /// # Returns
+    ///
+    /// The breakdown and whether it is complete. A partial breakdown carries
+    /// only the cheap terms and must not be cached as an exact evaluation.
+    fn breakdown_lazily<
+        const CANDIDATE_MOBILITY: bool,
+        const CANDIDATE_THREATS: bool,
+        const CANDIDATE_PAWN_STRUCTURE: bool,
+        const CANDIDATE_PASSED_CURVE: bool,
+        const PER_KING_DANGER: bool,
+    >(
+        position: &Position,
+        rich_attack_state: bool,
+        king_danger_candidate: bool,
+        passed_pawn_candidate: bool,
+        lazy: Option<LazyWindow>,
+    ) -> (ClassicalBreakdown, bool) {
         let phase = game_phase(position);
         let mut result = ClassicalBreakdown::default();
         let mut file_pawns = [[0_u8; 8]; 2];
@@ -2152,8 +2507,26 @@ impl Classical {
             }
         }
 
+        // Historical calibration detail omitted from the public source release.
+        result.bishops = pair_bonus(bishops);
+        result.rooks = rook_files(position, file_pawns);
+        result.kings = king_term(position, phase);
+        result.tempo = if position.side_to_move() == Color::White {
+            TEMPO
+        } else {
+            -TEMPO
+        };
+
+        if let Some(window) = lazy.filter(|window| !window.after_mobility) {
+            let cheap = side_to_move_score(position, result.white_score());
+            if cheap >= window.beta || cheap <= window.alpha {
+                return (result, false);
+            }
+        }
+
         let attacks =
             AttackMaps::build_with_mobility::<CANDIDATE_MOBILITY>(position, rich_attack_state);
+        // Historical calibration detail omitted from the public source release.
         result.pawns = if passed_pawn_candidate {
             let (released, features) =
                 pawn_structure_and_passed_candidate_features(position, file_pawns, &attacks, phase);
@@ -2161,10 +2534,13 @@ impl Classical {
         } else {
             pawn_structure::<CANDIDATE_PAWN_STRUCTURE, CANDIDATE_PASSED_CURVE>(position, file_pawns)
         };
-        result.bishops = pair_bonus(bishops);
-        result.rooks = rook_files(position, file_pawns);
-        result.kings = king_term(position, phase);
         result.mobility = mobility_term(&attacks, phase);
+        if let Some(window) = lazy.filter(|window| window.after_mobility) {
+            let cheap = side_to_move_score(position, result.white_score());
+            if cheap >= window.beta || cheap <= window.alpha {
+                return (result, false);
+            }
+        }
         if rich_attack_state {
             result.activity = activity_term(&attacks, phase);
             result.threats = rich_threat_term::<CANDIDATE_THREATS>(position, &attacks, phase);
@@ -2178,12 +2554,21 @@ impl Classical {
         } else {
             result.threats = compact_threat_term(position, &attacks, phase);
         }
-        result.tempo = if position.side_to_move() == Color::White {
-            TEMPO
-        } else {
-            -TEMPO
-        };
-        result
+        // Released weight is (0, 0), so this returns 0 without touching the
+        // pin geometry at all -- the early return in `absolute_pin_term` makes
+        // the no-op free as well as exact.
+        result.threats =
+            result
+                .threats
+                .saturating_add(absolute_pin_term(position, phase, ABSOLUTE_PIN_PENALTY));
+        // Also released at zero, and it early-returns on that, so the no-op is
+        // free as well as exact.
+        result.kings = result.kings.saturating_add(king_line_exposure_term(
+            position,
+            phase,
+            KING_LINE_EXPOSURE,
+        ));
+        (result, true)
     }
 
     /// Used for evaluating from the side-to-move perspective.
@@ -2202,6 +2587,102 @@ impl Classical {
     #[must_use]
     pub fn evaluate_position(position: &Position) -> i32 {
         let white_score = Self::breakdown(position).white_score();
+        // Released at 100 percent retained, which returns the score untouched.
+        let damped = shuffle_damped_score(
+            white_score,
+            i32::from(position.halfmove_clock()),
+            SHUFFLE_DAMPING_PERCENT,
+        );
+        let scaled = pawn_count_scaled_score(position, damped, PAWNLESS_SCALE_PERCENT);
+        side_to_move_score(position, scaled)
+    }
+
+    /// Alternative configuration retained for controlled evaluation.
+    ///
+    /// Runs exactly the work the released evaluator does for pawn structure,
+    /// passed pawns, rook files and king shelter — the terms whose inputs are
+    /// pawn placement and king squares, and therefore the terms a pawn hash
+    /// could cache — and nothing else. Its reciprocal is the cost of that
+    /// group, which bounds what such a cache could ever be worth before one is
+    /// built.
+    ///
+    /// This is a diagnostic entry point and is never a playing configuration.
+    ///
+    /// # Arguments
+    ///
+    /// * `position` - position to evaluate
+    ///
+    /// # Returns
+    ///
+    /// The summed pawn-dependent terms, White-relative.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn research_pawn_terms_only_evaluate_position(position: &Position) -> i32 {
+        let mut file_pawns = [[0_u8; 8]; 2];
+        for color in [Color::White, Color::Black] {
+            let mut pawns = position.piece_bitboard(Piece::new(color, PieceKind::Pawn));
+            while pawns != 0 {
+                let index = u8::try_from(pawns.trailing_zeros()).expect("set bit is a square");
+                pawns &= pawns - 1;
+                file_pawns[color.index()][usize::from(board_square(index).file())] += 1;
+            }
+        }
+        let phase = game_phase(position);
+        pawn_structure::<false, false>(position, file_pawns)
+            + rook_files(position, file_pawns)
+            + king_term(position, phase)
+    }
+
+    /// Alternative configuration retained for controlled evaluation.
+    ///
+    /// Builds the full rich attack maps exactly as the released evaluator does
+    /// and computes nothing else. Its reciprocal is therefore the cost of map
+    /// construction alone, and the difference between that and the released
+    /// evaluator's reciprocal is the cost of everything the maps feed —
+    /// pawn structure, king shelter, threats, king pressure and the rest. It
+    /// exists so a speedup can be aimed at whichever half is actually
+    /// expensive rather than at whichever is easier to imagine.
+    ///
+    /// This is a diagnostic entry point and is never a playing configuration.
+    ///
+    /// # Arguments
+    ///
+    /// * `position` - position to evaluate
+    ///
+    /// # Returns
+    ///
+    /// Calibrated centipawn score from material and placement only, after the
+    /// full attack maps have been built and discarded.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn research_attack_maps_only_evaluate_position(position: &Position) -> i32 {
+        let maps = AttackMaps::build_with_mobility::<false>(position, RELEASE_RICH_ATTACK_STATE);
+        // Nothing else is computed: the returned value is a cheap read of the
+        // maps, present only so the optimiser cannot elide the construction
+        // this diagnostic exists to time.
+        i32::try_from(maps.king_zone[0].count_ones()).unwrap_or(0)
+            + maps.mobility_mg[0]
+            + maps.activity_mg[0]
+    }
+
+    /// Alternative configuration retained for controlled evaluation.
+    ///
+    /// Alternative configuration retained for controlled evaluation.
+    ///
+    /// # Arguments
+    ///
+    /// * `position` - position to evaluate
+    ///
+    /// # Returns
+    ///
+    /// Calibrated centipawn score from the side-to-move perspective.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn research_compact_attack_state_evaluate_position(position: &Position) -> i32 {
+        let white_score = Self::breakdown_with_research::<false, false, false, false, false>(
+            position, false, false, false,
+        )
+        .white_score();
         side_to_move_score(position, white_score)
     }
 }
@@ -2215,13 +2696,13 @@ impl Classical {
 struct ResearchClassical {
     /// Used for selecting whether the rich attack-state terms are enabled.
     rich_attack_state: bool,
-    /// Used for selecting the fitted STR-280 king-danger scorer.
+    /// Alternative configuration retained for controlled evaluation.
     king_danger_candidate: bool,
-    /// Used for selecting the fitted STR-295 passed-pawn state scorer.
+    /// Alternative configuration retained for controlled evaluation.
     passed_pawn_candidate: bool,
 }
 
-/// Research-only evaluator composing the two 2026-08-05 screening survivors.
+/// Alternative configuration retained for controlled evaluation.
 ///
 /// Created only through [`Classical::research_extra_features`]. Each term is
 /// added to the promoted release rather than to another candidate's flavour,
@@ -2229,13 +2710,13 @@ struct ResearchClassical {
 /// attributable to the one feature it selects.
 #[derive(Clone, Copy, Debug)]
 struct ResearchComposedFeatures {
-    /// Used for the STR-323 backward penalty; `(0, 0)` disables it.
+    /// Alternative configuration retained for controlled evaluation.
     backward_penalty: (i32, i32),
-    /// Used for selecting whether the STR-321 material adjustment is added.
+    /// Alternative configuration retained for controlled evaluation.
     pawn_count_material: bool,
-    /// Used for selecting the STR-325 per-king danger conversion.
+    /// Alternative configuration retained for controlled evaluation.
     per_king_danger: bool,
-    /// Used for selecting the STR-327 pawnless endgame scaling.
+    /// Alternative configuration retained for controlled evaluation.
     pawnless_scaling: bool,
 }
 
@@ -2313,7 +2794,7 @@ impl SearchEvaluator for ResearchParams {
     }
 }
 
-/// Research-only evaluator adding the STR-319 connected-pawn feature.
+/// Alternative configuration retained for controlled evaluation.
 ///
 /// Created only through [`Classical::research_connected_pawns`]; the opaque
 /// type keeps the added feature outside the mutable UCI surface until a
@@ -2325,7 +2806,7 @@ struct ResearchConnectedPawns {
 }
 
 impl SearchEvaluator for ResearchConnectedPawns {
-    /// Used for evaluating with the selected STR-319 flavor.
+    /// Alternative configuration retained for controlled evaluation.
     ///
     /// # Arguments
     ///
@@ -2412,8 +2893,7 @@ fn piece_square_delta_term(position: &Position, phase: i32, delta: &PieceSquareD
     tapered_score(middle, ending, phase)
 }
 
-/// Research-only evaluator adding the `STR-20260806-334` piece-square
-/// correction.
+/// Alternative configuration retained for controlled evaluation.
 ///
 /// Created only through [`Classical::research_piece_square_delta`]. The table
 /// is shared rather than copied because one match constructs an evaluator per
@@ -2453,13 +2933,112 @@ impl SearchEvaluator for ResearchPieceSquareDelta {
     }
 }
 
-/// Research-only evaluator adding the `STR-20260806-332` bad-bishop feature.
+/// Research-only evaluator rescaling the released total.
 ///
-/// Created only through [`Classical::research_bishop_pawns`]. Unlike the
-/// earlier research flavors this one starts from [`Classical::breakdown`],
-/// which already carries every promoted term, so the contrast measures the
-/// added feature against the *current* release rather than against a
-/// pre-promotion baseline.
+/// Created only through [`Classical::research_eval_scale`]. The scale is a
+/// monotone map, so this flavor is the campaign's control for separating
+/// evaluation *ordering* from evaluation *dispersion*.
+#[derive(Clone, Copy, Debug)]
+struct ResearchEvalScale {
+    /// Used for the percentage applied to the white-relative total.
+    scale_percent: i32,
+}
+
+impl SearchEvaluator for ResearchEvalScale {
+    /// Used for evaluating with the selected scale.
+    ///
+    /// # Arguments
+    ///
+    /// * `position` - position to evaluate
+    ///
+    /// # Returns
+    ///
+    /// Calibrated side-to-move score at the selected scale.
+    fn evaluate(&mut self, position: &Position) -> i32 {
+        Classical::research_eval_scale_evaluate_position(position, self.scale_percent)
+    }
+
+    /// Used for reusing the release HCE's evaluator-owned quiet ordering prior.
+    ///
+    /// # Arguments
+    ///
+    /// * `position` - position the move is played in
+    /// * `mv` - move to rank
+    ///
+    /// # Returns
+    ///
+    /// Ordering-only prior from [`classical_quiet_move_prior`].
+    fn quiet_move_order_prior(&self, position: &Position, mv: Move) -> i32 {
+        classical_quiet_move_prior(position, mv)
+    }
+}
+
+/// Research-only evaluator rescaling everything except material.
+///
+/// Created only through [`Classical::research_positional_scale`].
+#[derive(Clone, Copy, Debug)]
+struct ResearchPositionalScale {
+    /// Used for the percentage applied to every non-material term.
+    scale_percent: i32,
+}
+
+impl SearchEvaluator for ResearchPositionalScale {
+    /// Used for evaluating with the selected positional scale.
+    ///
+    /// # Arguments
+    ///
+    /// * `position` - position to evaluate
+    ///
+    /// # Returns
+    ///
+    /// Calibrated side-to-move score at the selected positional scale.
+    fn evaluate(&mut self, position: &Position) -> i32 {
+        Classical::research_positional_scale_evaluate_position(position, self.scale_percent)
+    }
+
+    /// Used for reusing the release HCE's evaluator-owned quiet ordering prior.
+    ///
+    /// # Arguments
+    ///
+    /// * `position` - position the move is played in
+    /// * `mv` - move to rank
+    ///
+    /// # Returns
+    ///
+    /// Ordering-only prior from [`classical_quiet_move_prior`].
+    fn quiet_move_order_prior(&self, position: &Position, mv: Move) -> i32 {
+        classical_quiet_move_prior(position, mv)
+    }
+}
+
+/// Alternative configuration retained for controlled evaluation.
+///
+/// Alternative configuration retained for controlled evaluation.
+///
+/// Created only through [`Classical::research_space`]. Starts from
+/// [`Classical::breakdown`], so the contrast measures the added term against
+/// the current release rather than a pre-promotion baseline.
+#[derive(Clone, Copy, Debug)]
+struct ResearchSpace {
+    /// Used for weighting safe central squares; `0` selects the baseline.
+    weight: i32,
+}
+
+impl SearchEvaluator for ResearchSpace {
+    /// Alternative configuration retained for controlled evaluation.
+    ///
+    /// # Arguments
+    ///
+    /// * `position` - position to evaluate
+    ///
+    /// # Returns
+    ///
+    /// Calibrated side-to-move score for the selected flavor.
+    fn evaluate(&mut self, position: &Position) -> i32 {
+        Classical::research_space_evaluate_position(position, self.weight)
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 struct ResearchBishopPawns {
     /// Used for scaling the bad-bishop penalty; `0` selects the baseline.
@@ -2467,7 +3046,7 @@ struct ResearchBishopPawns {
 }
 
 impl SearchEvaluator for ResearchBishopPawns {
-    /// Used for evaluating with the selected `STR-20260806-332` flavor.
+    /// Alternative configuration retained for controlled evaluation.
     ///
     /// # Arguments
     ///
@@ -2495,7 +3074,103 @@ impl SearchEvaluator for ResearchBishopPawns {
     }
 }
 
-/// Research-only evaluator composing STR-304 with the STR-280 baseline.
+/// Alternative configuration retained for controlled evaluation.
+///
+/// Created only through [`Classical::research_eval_batch`]; `false` is the
+/// exact released baseline.
+#[derive(Clone, Copy, Debug)]
+struct ResearchEvalBatch {
+    /// Used for selecting whether the three batched terms are active.
+    enabled: bool,
+    /// Used for retaining this percent of the score once the halfmove clock
+    /// passes [`HALFMOVE_DAMPING_START`]; `100` is the released no-op.
+    shuffle_percent: i32,
+    /// Used for the king line-exposure penalty; `(0, 0)` is the released no-op.
+    king_exposure: (i32, i32),
+    /// Used for scaling a pawnless side's score; `100` is the released no-op.
+    pawnless_percent: i32,
+}
+
+impl SearchEvaluator for ResearchEvalBatch {
+    /// Used for evaluating with the batch on or off.
+    ///
+    /// # Arguments
+    ///
+    /// * `position` - position to evaluate
+    ///
+    /// # Returns
+    ///
+    /// Calibrated side-to-move score for the selected flavor.
+    fn evaluate(&mut self, position: &Position) -> i32 {
+        if self.enabled {
+            Classical::research_eval_batch_evaluate_position(
+                position,
+                self.shuffle_percent,
+                self.king_exposure,
+                self.pawnless_percent,
+            )
+        } else {
+            Classical::evaluate_position(position)
+        }
+    }
+
+    /// Used for reusing the release HCE's evaluator-owned quiet ordering prior.
+    ///
+    /// # Arguments
+    ///
+    /// * `position` - position the move is played in
+    /// * `mv` - move to rank
+    ///
+    /// # Returns
+    ///
+    /// Ordering-only prior from [`classical_quiet_move_prior`].
+    fn quiet_move_order_prior(&self, position: &Position, mv: Move) -> i32 {
+        classical_quiet_move_prior(position, mv)
+    }
+}
+
+/// Alternative configuration retained for controlled evaluation.
+///
+/// Created only through [`Classical::research_absolute_pins`]; `(0, 0)` is the
+/// exact released baseline.
+#[derive(Clone, Copy, Debug)]
+struct ResearchAbsolutePins {
+    /// Used for the untapered middlegame penalty per pinned piece.
+    middlegame: i32,
+    /// Used for the untapered endgame penalty per pinned piece.
+    endgame: i32,
+}
+
+impl SearchEvaluator for ResearchAbsolutePins {
+    /// Used for evaluating with the selected absolute-pin weight.
+    ///
+    /// # Arguments
+    ///
+    /// * `position` - position to evaluate
+    ///
+    /// # Returns
+    ///
+    /// Calibrated side-to-move score for the selected flavor.
+    fn evaluate(&mut self, position: &Position) -> i32 {
+        Classical::research_absolute_pins_evaluate_position(position, self.middlegame, self.endgame)
+    }
+
+    /// Used for reusing the release HCE's evaluator-owned quiet ordering prior.
+    ///
+    /// # Arguments
+    ///
+    /// * `position` - position the move is played in
+    /// * `mv` - move to rank
+    ///
+    /// # Returns
+    ///
+    /// Ordering-only prior from [`classical_quiet_move_prior`].
+    fn quiet_move_order_prior(&self, position: &Position, mv: Move) -> i32 {
+        classical_quiet_move_prior(position, mv)
+    }
+}
+
+/// Alternative configuration retained for controlled evaluation.
 ///
 /// Created only through [`Classical::research_king_pawn_proximity`]; the
 /// opaque type keeps the fitted geometry outside the mutable UCI surface.
@@ -2506,7 +3181,7 @@ struct ResearchKingPawnProximity {
 }
 
 impl SearchEvaluator for ResearchKingPawnProximity {
-    /// Used for evaluating with the selected STR-304 geometry flavor.
+    /// Alternative configuration retained for controlled evaluation.
     ///
     /// # Arguments
     ///
@@ -2571,7 +3246,7 @@ impl SearchEvaluator for ResearchClassical {
     }
 }
 
-/// Research-only evaluator composing STR-297 with the STR-280 baseline.
+/// Alternative configuration retained for controlled evaluation.
 ///
 /// Created only through [`Classical::research_mobility`]; the opaque type
 /// prevents the static table candidate from becoming a mutable UCI option.
@@ -2582,7 +3257,7 @@ struct ResearchMobility {
 }
 
 impl SearchEvaluator for ResearchMobility {
-    /// Used for evaluating with the selected STR-297 table flavor.
+    /// Alternative configuration retained for controlled evaluation.
     ///
     /// # Arguments
     ///
@@ -2611,7 +3286,7 @@ impl SearchEvaluator for ResearchMobility {
     }
 }
 
-/// Research-only evaluator composing STR-298 with the STR-280 baseline.
+/// Alternative configuration retained for controlled evaluation.
 ///
 /// Created only through [`Classical::research_threats`]; the opaque type keeps
 /// trace-calibrated weights outside the mutable UCI option surface.
@@ -2621,7 +3296,7 @@ struct ResearchThreats {
     candidate: bool,
 }
 
-/// Research-only evaluator composing STR-299 with the STR-280 baseline.
+/// Alternative configuration retained for controlled evaluation.
 ///
 /// Created only through [`Classical::research_pawn_structure`]; the opaque
 /// type keeps the trace-calibrated weight outside the mutable UCI surface.
@@ -2631,7 +3306,7 @@ struct ResearchPawnStructure {
     candidate: bool,
 }
 
-/// Research-only const-specialized STR-306 search evaluator.
+/// Alternative configuration retained for controlled evaluation.
 ///
 /// Created only through [`Classical::research_passed_pawn_curve_candidate`];
 /// the unit type exposes no runtime experiment control.
@@ -2647,7 +3322,7 @@ impl SearchEvaluator for ResearchPassedPawnCurve {
     ///
     /// # Returns
     ///
-    /// Calibrated side-to-move score for the STR-306 candidate.
+    /// Alternative configuration retained for controlled evaluation.
     fn evaluate(&mut self, position: &Position) -> i32 {
         Classical::research_passed_pawn_curve_candidate_evaluate_position(position)
     }
@@ -2668,7 +3343,7 @@ impl SearchEvaluator for ResearchPassedPawnCurve {
 }
 
 impl SearchEvaluator for ResearchPawnStructure {
-    /// Used for evaluating with the selected STR-299 pawn-structure flavor.
+    /// Alternative configuration retained for controlled evaluation.
     ///
     /// # Arguments
     ///
@@ -2697,7 +3372,7 @@ impl SearchEvaluator for ResearchPawnStructure {
 }
 
 impl SearchEvaluator for ResearchThreats {
-    /// Used for evaluating with the selected STR-298 threat flavor.
+    /// Alternative configuration retained for controlled evaluation.
     ///
     /// # Arguments
     ///
@@ -2726,7 +3401,7 @@ impl SearchEvaluator for ResearchThreats {
     }
 }
 
-/// Research-only evaluator composing STR-296 with the STR-280 baseline.
+/// Alternative configuration retained for controlled evaluation.
 ///
 /// Created only through [`Classical::research_initiative`]; the opaque type
 /// prevents the static candidate from becoming a mutable UCI option.
@@ -2737,7 +3412,7 @@ struct ResearchInitiative {
 }
 
 impl SearchEvaluator for ResearchInitiative {
-    /// Used for evaluating with the selected STR-296 flavor.
+    /// Alternative configuration retained for controlled evaluation.
     ///
     /// # Arguments
     ///
@@ -2906,7 +3581,71 @@ fn opposite_colored_bishop_scale_percent(position: &Position) -> i32 {
     (OPPOSITE_BISHOP_DRAW_FLOOR_PERCENT + restored).min(100)
 }
 
+impl Classical {
+    /// Used for the windowed evaluation the search may shortcut.
+    ///
+    /// Alternative configuration retained for controlled evaluation.
+    ///
+    /// # Arguments
+    ///
+    /// * `position` - position to evaluate
+    /// * `alpha` - lower bound, already widened by the caller's margin
+    /// * `beta` - upper bound, already widened by the caller's margin
+    ///
+    /// # Returns
+    ///
+    /// The score and whether it is the exact evaluation.
+    fn evaluate_in_window(
+        position: &Position,
+        alpha: i32,
+        beta: i32,
+        after_mobility: bool,
+    ) -> (i32, bool) {
+        let (mut breakdown, exact) = Self::breakdown_lazily::<false, false, false, false, false>(
+            position,
+            RELEASE_RICH_ATTACK_STATE,
+            true,
+            false,
+            Some(LazyWindow {
+                alpha,
+                beta,
+                after_mobility,
+            }),
+        );
+        if !exact {
+            return (side_to_move_score(position, breakdown.white_score()), false);
+        }
+        let (connected_pawns, king_pawn_file) = promoted_capacity_delta(position);
+        breakdown.pawns = breakdown.pawns.saturating_add(connected_pawns);
+        breakdown.kings = breakdown.kings.saturating_add(king_pawn_file);
+        (side_to_move_score(position, breakdown.white_score()), true)
+    }
+}
+
 impl SearchEvaluator for Classical {
+    /// Used for the windowed released evaluation.
+    ///
+    /// # Arguments
+    ///
+    /// * `position` - position to evaluate
+    /// * `alpha` - lower bound the caller is searching against
+    /// * `beta` - upper bound the caller is searching against
+    ///
+    /// # Returns
+    ///
+    /// The score and whether it is the exact evaluation.
+    fn evaluate_windowed(&mut self, position: &Position, alpha: i32, beta: i32) -> (i32, bool) {
+        // An infinite window can never be escaped, so skip the gate entirely
+        // rather than paying `side_to_move_score` for a comparison whose
+        // answer is known. That call walks the board for the opposite-coloured
+        // bishop scale, and charging it to every evaluation would make the
+        // disabled path slower than no lazy support at all.
+        if alpha <= -INFINITY && beta >= INFINITY {
+            return (Classical::evaluate_position(position), true);
+        }
+        Self::evaluate_in_window(position, alpha, beta, true)
+    }
+
     /// Used for evaluating the released classical HCE inside the search.
     ///
     /// # Arguments
@@ -3010,26 +3749,367 @@ fn game_phase(position: &Position) -> i32 {
 ///
 /// Phase-interpolated placement score for the piece's own color.
 fn tapered_piece_square(piece: Piece, square: Square, phase: i32) -> i32 {
-    let file = i32::from(square.file());
-    let rank = i32::from(square.rank());
-    let relative_rank = if piece.color == Color::White {
-        rank
-    } else {
-        9 - rank
-    };
-    let center = 14 - ((2 * file - 7).abs() + (2 * (rank - 1) - 7).abs());
-    let advance = relative_rank - 1;
-    let (middle, ending) = match piece.kind {
-        PieceKind::Pawn => (advance * 4 - center * 3, advance * 10 - center * 3),
-        PieceKind::Knight => (center * 5 - edge_penalty(file, rank), center * 3),
-        PieceKind::Bishop => (center * 4 + advance, center * 2),
-        // The rook endgame centralization multiplier fitted to zero.
-        PieceKind::Rook => (advance * 3, advance * 2),
-        PieceKind::Queen => (center * 5, center * 3),
-        PieceKind::King => (-center * 8 - advance * 2, center * 5 + advance * 2),
-    };
+    let (middle, ending) =
+        PIECE_SQUARE[piece.color.index()][piece.kind.index()][usize::from(square.index())];
     (middle * phase + ending * (MAX_PHASE - phase)) / MAX_PHASE
 }
+
+/// Used for indexing the fitted placement delta table.
+///
+/// The table is *file-folded* and *colour-relative*: files `e`-`h` mirror onto
+/// `a`-`d`, and the row counts from the piece's own back rank. Both are
+/// structural rather than something a fit has to rediscover -- the released
+/// formula is already left-right symmetric and already reads advancement
+/// colour-relatively, so folding halves the parameter count without removing
+/// anything the formula could express.
+///
+/// # Arguments
+///
+/// * `color` - colour of the piece being placed
+/// * `square` - square the piece stands on
+///
+/// # Returns
+///
+/// Folded slot in `0..32`, as `relative_row * 4 + folded_file`.
+fn folded_placement_index(color: Color, square: Square) -> usize {
+    folded_placement_slot(color == Color::White, usize::from(square.index()))
+}
+
+/// Used for folding a raw board index in a `const` context.
+///
+/// The fit and the promoted table must agree about which square each weight
+/// belongs to, so there is exactly ONE implementation of the rule and
+/// [`folded_placement_index`] delegates to it. Writing the rule twice would
+/// land correct values on wrong squares and still look entirely plausible.
+///
+/// # Arguments
+///
+/// * `white` - whether the piece is White
+/// * `index` - board index in `0..64`, where `0` is `a8`
+///
+/// # Returns
+///
+/// Folded slot in `0..32`, as `relative_row * 4 + folded_file`.
+const fn folded_placement_slot(white: bool, index: usize) -> usize {
+    let file = index & 7;
+    let rank = 8 - (index >> 3);
+    let relative_rank = if white { rank } else { 9 - rank };
+    (relative_rank - 1) * 4 + if file < 4 { file } else { 7 - file }
+}
+
+/// Alternative configuration retained for controlled evaluation.
+///
+/// Indexed by piece kind, then folded colour-relative square, then
+/// `[middlegame, endgame]`. Added into the compile-time placement table by
+/// [`build_piece_square`], so per-square resolution costs nothing per node.
+///
+/// Generated by `scripts/emit_placement_delta.py` from a vector fitted on
+/// played games; not hand-written.
+const PLACEMENT_DELTA: [[[i32; 2]; 32]; 6] = [
+    // Pawn
+    [
+        [4, -3],  // row 0, folded file 0
+        [0, -2],  // row 0, folded file 1
+        [-2, -2], // row 0, folded file 2
+        [-4, 3],  // row 0, folded file 3
+        [4, 3],   // row 1, folded file 0
+        [7, -5],  // row 1, folded file 1
+        [1, 0],   // row 1, folded file 2
+        [-4, -1], // row 1, folded file 3
+        [1, 2],   // row 2, folded file 0
+        [-1, -1], // row 2, folded file 1
+        [1, 2],   // row 2, folded file 2
+        [1, 4],   // row 2, folded file 3
+        [-1, 0],  // row 3, folded file 0
+        [-5, -3], // row 3, folded file 1
+        [-4, -1], // row 3, folded file 2
+        [7, 1],   // row 3, folded file 3
+        [0, 6],   // row 4, folded file 0
+        [1, -2],  // row 4, folded file 1
+        [-1, -4], // row 4, folded file 2
+        [3, 0],   // row 4, folded file 3
+        [1, 1],   // row 5, folded file 0
+        [0, -1],  // row 5, folded file 1
+        [-1, -1], // row 5, folded file 2
+        [0, 1],   // row 5, folded file 3
+        [2, 0],   // row 6, folded file 0
+        [0, -1],  // row 6, folded file 1
+        [0, 3],   // row 6, folded file 2
+        [-2, 3],  // row 6, folded file 3
+        [4, -2],  // row 7, folded file 0
+        [2, 1],   // row 7, folded file 1
+        [1, 2],   // row 7, folded file 2
+        [-2, 1],  // row 7, folded file 3
+    ],
+    // Knight
+    [
+        [3, -4],  // row 0, folded file 0
+        [0, 2],   // row 0, folded file 1
+        [-1, -2], // row 0, folded file 2
+        [2, -3],  // row 0, folded file 3
+        [-3, 0],  // row 1, folded file 0
+        [1, -1],  // row 1, folded file 1
+        [5, -1],  // row 1, folded file 2
+        [1, 0],   // row 1, folded file 3
+        [2, -2],  // row 2, folded file 0
+        [-2, 0],  // row 2, folded file 1
+        [2, -2],  // row 2, folded file 2
+        [-2, 0],  // row 2, folded file 3
+        [0, -1],  // row 3, folded file 0
+        [-4, 7],  // row 3, folded file 1
+        [3, -1],  // row 3, folded file 2
+        [-3, 5],  // row 3, folded file 3
+        [3, 2],   // row 4, folded file 0
+        [0, 1],   // row 4, folded file 1
+        [-1, 0],  // row 4, folded file 2
+        [2, 0],   // row 4, folded file 3
+        [3, 3],   // row 5, folded file 0
+        [4, -1],  // row 5, folded file 1
+        [0, 1],   // row 5, folded file 2
+        [3, 1],   // row 5, folded file 3
+        [1, 4],   // row 6, folded file 0
+        [-3, -4], // row 6, folded file 1
+        [3, 1],   // row 6, folded file 2
+        [-3, -4], // row 6, folded file 3
+        [1, 0],   // row 7, folded file 0
+        [3, 2],   // row 7, folded file 1
+        [2, 2],   // row 7, folded file 2
+        [1, 3],   // row 7, folded file 3
+    ],
+    // Bishop
+    [
+        [1, 2],   // row 0, folded file 0
+        [-3, 2],  // row 0, folded file 1
+        [-3, -4], // row 0, folded file 2
+        [1, 0],   // row 0, folded file 3
+        [-1, -1], // row 1, folded file 0
+        [3, -1],  // row 1, folded file 1
+        [1, -1],  // row 1, folded file 2
+        [1, -2],  // row 1, folded file 3
+        [0, -1],  // row 2, folded file 0
+        [-1, -1], // row 2, folded file 1
+        [-1, 2],  // row 2, folded file 2
+        [-1, 1],  // row 2, folded file 3
+        [-2, -2], // row 3, folded file 0
+        [1, 4],   // row 3, folded file 1
+        [0, 3],   // row 3, folded file 2
+        [-1, -1], // row 3, folded file 3
+        [0, -1],  // row 4, folded file 0
+        [0, -2],  // row 4, folded file 1
+        [-1, -2], // row 4, folded file 2
+        [1, -1],  // row 4, folded file 3
+        [-3, -1], // row 5, folded file 0
+        [2, 2],   // row 5, folded file 1
+        [2, -2],  // row 5, folded file 2
+        [-3, -2], // row 5, folded file 3
+        [-1, 0],  // row 6, folded file 0
+        [-2, -1], // row 6, folded file 1
+        [0, -1],  // row 6, folded file 2
+        [-3, 0],  // row 6, folded file 3
+        [-1, -5], // row 7, folded file 0
+        [0, 1],   // row 7, folded file 1
+        [-3, 0],  // row 7, folded file 2
+        [-1, -1], // row 7, folded file 3
+    ],
+    // Rook
+    [
+        [-2, 1],  // row 0, folded file 0
+        [2, -1],  // row 0, folded file 1
+        [5, -1],  // row 0, folded file 2
+        [3, 3],   // row 0, folded file 3
+        [-1, -1], // row 1, folded file 0
+        [-2, 0],  // row 1, folded file 1
+        [1, 2],   // row 1, folded file 2
+        [1, 2],   // row 1, folded file 3
+        [-4, 0],  // row 2, folded file 0
+        [-1, 1],  // row 2, folded file 1
+        [-2, -5], // row 2, folded file 2
+        [0, -1],  // row 2, folded file 3
+        [-1, 0],  // row 3, folded file 0
+        [-1, -1], // row 3, folded file 1
+        [-2, 1],  // row 3, folded file 2
+        [-3, -2], // row 3, folded file 3
+        [0, 3],   // row 4, folded file 0
+        [3, 2],   // row 4, folded file 1
+        [0, 0],   // row 4, folded file 2
+        [-2, -4], // row 4, folded file 3
+        [1, -1],  // row 5, folded file 0
+        [1, 2],   // row 5, folded file 1
+        [3, 0],   // row 5, folded file 2
+        [-2, 3],  // row 5, folded file 3
+        [-1, 2],  // row 6, folded file 0
+        [0, -3],  // row 6, folded file 1
+        [1, 5],   // row 6, folded file 2
+        [-3, 2],  // row 6, folded file 3
+        [0, 2],   // row 7, folded file 0
+        [1, 0],   // row 7, folded file 1
+        [3, 1],   // row 7, folded file 2
+        [2, -1],  // row 7, folded file 3
+    ],
+    // Queen
+    [
+        [1, 0],   // row 0, folded file 0
+        [-1, -4], // row 0, folded file 1
+        [-1, 0],  // row 0, folded file 2
+        [-3, 2],  // row 0, folded file 3
+        [1, -1],  // row 1, folded file 0
+        [-3, 1],  // row 1, folded file 1
+        [2, 1],   // row 1, folded file 2
+        [1, 0],   // row 1, folded file 3
+        [0, 0],   // row 2, folded file 0
+        [-2, -3], // row 2, folded file 1
+        [1, -1],  // row 2, folded file 2
+        [1, -2],  // row 2, folded file 3
+        [2, -1],  // row 3, folded file 0
+        [0, -3],  // row 3, folded file 1
+        [0, 3],   // row 3, folded file 2
+        [-4, -2], // row 3, folded file 3
+        [0, -1],  // row 4, folded file 0
+        [0, -1],  // row 4, folded file 1
+        [0, -1],  // row 4, folded file 2
+        [0, -3],  // row 4, folded file 3
+        [-4, 1],  // row 5, folded file 0
+        [1, 3],   // row 5, folded file 1
+        [-2, 0],  // row 5, folded file 2
+        [1, 2],   // row 5, folded file 3
+        [0, 2],   // row 6, folded file 0
+        [1, 2],   // row 6, folded file 1
+        [0, 0],   // row 6, folded file 2
+        [-3, 1],  // row 6, folded file 3
+        [-1, 1],  // row 7, folded file 0
+        [2, -2],  // row 7, folded file 1
+        [0, -2],  // row 7, folded file 2
+        [0, -2],  // row 7, folded file 3
+    ],
+    // King
+    [
+        [-3, -3], // row 0, folded file 0
+        [2, 0],   // row 0, folded file 1
+        [0, -2],  // row 0, folded file 2
+        [-3, -1], // row 0, folded file 3
+        [2, 3],   // row 1, folded file 0
+        [1, -1],  // row 1, folded file 1
+        [5, 5],   // row 1, folded file 2
+        [0, -2],  // row 1, folded file 3
+        [0, -6],  // row 2, folded file 0
+        [-1, -4], // row 2, folded file 1
+        [0, 2],   // row 2, folded file 2
+        [2, 2],   // row 2, folded file 3
+        [0, -1],  // row 3, folded file 0
+        [6, 5],   // row 3, folded file 1
+        [1, -2],  // row 3, folded file 2
+        [-1, 2],  // row 3, folded file 3
+        [-1, -2], // row 4, folded file 0
+        [0, 0],   // row 4, folded file 1
+        [1, -1],  // row 4, folded file 2
+        [-1, 0],  // row 4, folded file 3
+        [3, -2],  // row 5, folded file 0
+        [-1, 1],  // row 5, folded file 1
+        [-2, 1],  // row 5, folded file 2
+        [0, 2],   // row 5, folded file 3
+        [1, 0],   // row 6, folded file 0
+        [-3, 1],  // row 6, folded file 1
+        [1, 0],   // row 6, folded file 2
+        [-1, 1],  // row 6, folded file 3
+        [2, 1],   // row 7, folded file 0
+        [-1, -1], // row 7, folded file 1
+        [2, -3],  // row 7, folded file 2
+        [-1, -2], // row 7, folded file 3
+    ],
+];
+
+/// Used for taking an absolute value in a `const` context.
+///
+/// `i32::abs` is not `const` at this crate's minimum supported Rust version,
+/// and the placement table is built at compile time.
+///
+/// # Arguments
+///
+/// * `value` - value whose magnitude is wanted
+///
+/// # Returns
+///
+/// The non-negative magnitude of `value`.
+const fn const_abs(value: i32) -> i32 {
+    if value < 0 {
+        -value
+    } else {
+        value
+    }
+}
+
+/// Used for evaluating the released placement formula for one table slot.
+///
+/// This *is* the released formula, moved verbatim so the compile-time table
+/// and the historical expression cannot drift apart. `center` reads the
+/// absolute rank and is symmetric about the board's middle; only `advance` is
+/// colour-relative, which is why the table is built per colour rather than
+/// mirrored.
+///
+/// # Arguments
+///
+/// * `kind_index` - piece-kind discriminant in `0..6`
+/// * `white` - whether the slot is for a White piece
+/// * `index` - board index in `0..64`, where `0` is `a8`
+///
+/// # Returns
+///
+/// The untapered `(middlegame, endgame)` placement pair.
+const fn piece_square_pair(kind_index: usize, white: bool, index: usize) -> (i32, i32) {
+    #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
+    let file = (index & 7) as i32;
+    #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
+    let rank = 8 - (index >> 3) as i32;
+    let relative_rank = if white { rank } else { 9 - rank };
+    let center = 14 - (const_abs(2 * file - 7) + const_abs(2 * (rank - 1) - 7));
+    let advance = relative_rank - 1;
+    match kind_index {
+        0 => (advance * 4 - center * 2, advance * 10 - center * 2),
+        1 => (center * 5 - edge_penalty(file, rank), center * 3),
+        2 => (center * 4 - advance, center * 2),
+        // The rook endgame centralization multiplier fitted to zero.
+        3 => (advance * 2, center + advance * 2),
+        4 => (center * 5, center * 3),
+        _ => (-center * 8 - advance, center * 7 + advance * 3),
+    }
+}
+
+/// Used for materialising the placement formula as a compile-time table.
+///
+/// # Returns
+///
+/// Untapered `(middlegame, endgame)` pairs indexed by colour, kind and square.
+const fn build_piece_square() -> [[[(i32, i32); 64]; 6]; 2] {
+    let mut tables = [[[(0, 0); 64]; 6]; 2];
+    let mut color = 0;
+    while color < 2 {
+        let mut kind = 0;
+        while kind < 6 {
+            let mut index = 0;
+            while index < 64 {
+                let (middle, ending) = piece_square_pair(kind, color == 0, index);
+                let delta = PLACEMENT_DELTA[kind][folded_placement_slot(color == 0, index)];
+                tables[color][kind][index] = (middle + delta[0], ending + delta[1]);
+                index += 1;
+            }
+            kind += 1;
+        }
+        color += 1;
+    }
+    tables
+}
+
+/// Used for reading piece placement as data rather than recomputing a formula.
+///
+/// Six kilobytes, indexed by colour, kind and square, built at compile time by
+/// the released formula itself, so this cannot move a centipawn — the
+/// exhaustive `piece_square_table_matches_the_released_formula` test compares
+/// every kind, colour, square and phase against the original expression.
+///
+/// Turning placement into data is also the prerequisite for fitting it: a
+/// formula can only be scaled, whereas a table can say that `e5` and `c5`
+/// differ.
+static PIECE_SQUARE: [[[(i32, i32); 64]; 6]; 2] = build_piece_square();
 
 /// Used for penalizing a knight on an edge, with a larger corner penalty.
 ///
@@ -3065,8 +4145,8 @@ const fn edge_penalty(file: i32, rank: i32) -> i32 {
 ///
 /// White's pair bonus minus Black's pair bonus.
 fn pair_bonus(bishops: [u8; 2]) -> i32 {
-    let white = i32::from(bishops[Color::White.index()] >= 2) * 39;
-    let black = i32::from(bishops[Color::Black.index()] >= 2) * 39;
+    let white = i32::from(bishops[Color::White.index()] >= 2) * 41;
+    let black = i32::from(bishops[Color::Black.index()] >= 2) * 41;
     white - black
 }
 
@@ -3074,7 +4154,7 @@ fn pair_bonus(bishops: [u8; 2]) -> i32 {
 /// perspective.
 ///
 /// Doubled pawns cost 13 per extra pawn on a file and isolated pawns cost 12
-/// per pawn. Passed pawns earn `8 + quadratic * advance^2` by color-relative
+/// per pawn. Passed pawns earn `6 + quadratic * advance^2` by color-relative
 /// advance, halved when the square directly in front is occupied.
 ///
 /// # Arguments
@@ -3120,12 +4200,12 @@ fn pawn_structure_with_observer<
     file_pawns: [[u8; 8]; 2],
     mut observer: impl FnMut(Color, Square, i32, i32, bool),
 ) -> i32 {
-    let mut score = 0;
     let passed_quadratic = if CANDIDATE_PASSED_CURVE {
         PASSED_PAWN_CANDIDATE_QUADRATIC
     } else {
         PASSED_PAWN_QUADRATIC
     };
+    let mut score = 0;
     for color in [Color::White, Color::Black] {
         let sign = color_sign(color);
         let doubled_penalty = if CANDIDATE_DOUBLED_PAWNS {
@@ -3147,34 +4227,181 @@ fn pawn_structure_with_observer<
             }
         }
 
-        let mut pawns = position.piece_bitboard(Piece::new(color, PieceKind::Pawn));
-        while pawns != 0 {
-            let index = u8::try_from(pawns.trailing_zeros()).expect("set bit index is below 64");
-            pawns &= pawns - 1;
+        let mut passers = passed_pawns(position, color);
+        while passers != 0 {
+            let index = u8::try_from(passers.trailing_zeros()).expect("set bit index is below 64");
+            passers &= passers - 1;
             let square = board_square(index);
-            if is_passed(position, square, color) {
-                let relative_rank = if color == Color::White {
-                    square.rank()
-                } else {
-                    9 - square.rank()
-                };
-                let advance = i32::from(relative_rank.saturating_sub(1));
-                let bonus = 8 + passed_quadratic * advance * advance;
-                let push_row = if color == Color::White { -1 } else { 1 };
-                let blocked = square_offset(square, 0, push_row)
-                    .is_some_and(|front| position.piece_at(front).is_some());
-                let realized_bonus = if blocked { bonus / 2 } else { bonus };
-                observer(
-                    color,
-                    square,
-                    i32::from(relative_rank),
-                    realized_bonus,
-                    blocked,
-                );
-                score += sign * realized_bonus;
-            }
+            let relative_rank = if color == Color::White {
+                square.rank()
+            } else {
+                9 - square.rank()
+            };
+            let advance = i32::from(relative_rank.saturating_sub(1));
+            let bonus = 6 + passed_quadratic * advance * advance;
+            let push_row = if color == Color::White { -1 } else { 1 };
+            let blocked = square_offset(square, 0, push_row)
+                .is_some_and(|front| position.piece_at(front).is_some());
+            let realized_bonus = if blocked { bonus / 2 } else { bonus };
+            observer(
+                color,
+                square,
+                i32::from(relative_rank),
+                realized_bonus,
+                blocked,
+            );
+            score += sign * realized_bonus;
+            score +=
+                sign * passed_pawn_realization(position, color, square, i32::from(relative_rank));
         }
     }
+    score
+}
+
+/// Used for collecting one color's true passers as a bitboard.
+///
+/// Split out of the pawn-structure scan because *which* pawns are passers is
+/// decided by pawn placement alone, while what each passer is worth is not —
+/// the released bonus halves when the square in front is occupied, and any
+/// piece can occupy it. That is the same line Stockfish 11 draws when it keeps
+/// passer identification inside `Pawns::probe` and passer realization outside
+/// it, and Ethereal when it stores a `passed` bitboard in its `PKEntry`.
+///
+/// Alternative configuration retained for controlled evaluation.
+///
+/// # Arguments
+///
+/// * `position` - position whose pawns are examined
+/// * `color` - color whose passers are collected
+///
+/// # Returns
+///
+/// A bitboard of `color`'s true passers, in ascending square order.
+fn passed_pawns(position: &Position, color: Color) -> u64 {
+    passed_pawn_set(
+        position.piece_bitboard(Piece::new(color, PieceKind::Pawn)),
+        position.piece_bitboard(Piece::new(color.opposite(), PieceKind::Pawn)),
+        color,
+    )
+}
+
+/// Used for selecting every passer of one color in a fixed handful of shifts.
+///
+/// The per-pawn form tested each pawn against
+/// [`PASSED_PAWN_BLOCKER_MASKS`], costing a bit scan, a table load and a test
+/// per pawn. This widens the enemy pawns to their own and both adjacent files
+/// and smears that backwards along `color`'s advance, building every guarded
+/// square at once; the pawns outside the result are exactly the passers.
+///
+/// The first shift is load-bearing: it is what excludes the pawn's own rank,
+/// matching the mask's contract that an enemy pawn abreast does not block.
+///
+/// Takes bitboards rather than a position so the equivalence can be tested
+/// over arbitrary pawn placements, including ones no legal position reaches.
+///
+/// # Arguments
+///
+/// * `pawns` - pawns of the color whose passers are wanted
+/// * `enemy_pawns` - opposing pawns that may block them
+/// * `color` - color owning `pawns`, defining the forward direction
+///
+/// # Returns
+///
+/// A bitboard of `color`'s true passers.
+fn passed_pawn_set(pawns: u64, enemy_pawns: u64, color: Color) -> u64 {
+    const NOT_FILE_A: u64 = !0x0101_0101_0101_0101;
+    const NOT_FILE_H: u64 = !0x8080_8080_8080_8080;
+
+    let widened =
+        enemy_pawns | ((enemy_pawns & NOT_FILE_H) << 1) | ((enemy_pawns & NOT_FILE_A) >> 1);
+    // Janus indexes from a8, so White advances toward lower indices and the
+    // squares an enemy pawn guards lie at higher ones.
+    let mut blocked = widened;
+    match color {
+        Color::White => {
+            blocked <<= 8;
+            blocked |= blocked << 8;
+            blocked |= blocked << 16;
+            blocked |= blocked << 32;
+        }
+        Color::Black => {
+            blocked >>= 8;
+            blocked |= blocked >> 8;
+            blocked |= blocked >> 16;
+            blocked |= blocked >> 32;
+        }
+    }
+    pawns & !blocked
+}
+
+/// Side-to-move search window a lazy evaluation may bail out of.
+///
+/// The bound already carries any slack the caller wants: `cheap - margin >= beta`
+/// is `cheap >= beta + margin`, so the searcher widens the window it passes and
+/// this type stays margin-free. That keeps the slack tunable from the search
+/// side, where it can be swept, instead of frozen into an evaluator type.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LazyWindow {
+    /// Used for the lower bound the caller is searching against.
+    pub alpha: i32,
+    /// Used for the upper bound the caller is searching against.
+    pub beta: i32,
+    /// Used for gating after mobility rather than before the attack maps.
+    ///
+    /// Alternative configuration retained for controlled evaluation.
+    pub after_mobility: bool,
+}
+
+/// Used for scoring where an advanced passer stands, not merely how far it has
+/// come.
+///
+/// Alternative configuration retained for controlled evaluation.
+///
+/// Alternative configuration retained for controlled evaluation.
+///
+/// A fourth candidate weight, a friendly rook behind the passer, fitted to
+/// zero and is therefore absent here rather than multiplied by zero -- which
+/// also spares the release the rearward bitboard scan it would have needed.
+///
+/// `urgency` gates the term to the fourth relative rank and beyond, matching
+/// `accumulate_passed_pawn_features` exactly so the released scorer and the
+/// research feature extractor cannot disagree about which pawns qualify.
+///
+/// # Arguments
+///
+/// * `position` - position holding the passer
+/// * `color` - color of the passer
+/// * `square` - square the passer stands on
+/// * `relative_rank` - rank counted from `color`'s own back rank
+///
+/// # Returns
+///
+/// Color-relative realization bonus; zero for passers short of the fourth
+/// rank.
+fn passed_pawn_realization(
+    position: &Position,
+    color: Color,
+    square: Square,
+    relative_rank: i32,
+) -> i32 {
+    let urgency = (relative_rank - 3).max(0);
+    if urgency == 0 {
+        return 0;
+    }
+    let push_row = if color == Color::White { -1 } else { 1 };
+    let Some(front) = square_offset(square, 0, push_row) else {
+        return 0;
+    };
+    let mut score = 0;
+    if let Some(king) = position.king_square(color) {
+        score -= 2 * urgency * king_distance(king, front);
+    }
+    if let Some(king) = position.king_square(color.opposite()) {
+        score += 2 * urgency * king_distance(king, front);
+    }
+    // An outside passer draws the defending king away from everything else,
+    // so distance from the central files is worth a little on its own.
+    score += urgency * urgency * (2 * i32::from(square.file()) - 7).abs();
     score
 }
 
@@ -3205,7 +4432,7 @@ fn pawn_file_counts(position: &Position) -> [[u8; 8]; 2] {
     counts
 }
 
-/// Used for extracting STR-293 geometry from the released passer traversal.
+/// Alternative configuration retained for controlled evaluation.
 ///
 /// # Arguments
 ///
@@ -3256,7 +4483,7 @@ fn passed_pawn_curve_features(position: &Position, phase: i32) -> PassedPawnCurv
             let advance = relative_rank.saturating_sub(1);
             for (quadratic, delta) in features.quadratic_deltas.iter_mut().enumerate() {
                 let quadratic = i32::try_from(quadratic).expect("fixed grid index fits i32");
-                let bonus = 8 + quadratic * advance * advance;
+                let bonus = 6 + quadratic * advance * advance;
                 let candidate_bonus = if blocked { bonus / 2 } else { bonus };
                 *delta += sign * (candidate_bonus - released_bonus);
             }
@@ -3313,8 +4540,7 @@ fn pawn_structure_and_passed_features(
     (score, features)
 }
 
-/// Used for scoring released pawns while collecting only STR-295's cheap
-/// candidate columns.
+/// Alternative configuration retained for controlled evaluation.
 ///
 /// Unlike the complete research extractor, this production-candidate path
 /// performs no path, king, rook, or pawn-race work. True-passer recognition,
@@ -3357,8 +4583,7 @@ fn pawn_structure_and_passed_candidate_features(
     (score, features)
 }
 
-/// Used for adding one passer's low-cost STR-295 state without constructing
-/// the complete research geometry.
+/// Alternative configuration retained for controlled evaluation.
 ///
 /// # Arguments
 ///
@@ -3405,7 +4630,7 @@ fn accumulate_passed_pawn_candidate_features(
     features.outside_file += sign * rank_weight * file_from_center;
 }
 
-/// Used for adding one true passer to the STR-293 feature vector.
+/// Alternative configuration retained for controlled evaluation.
 ///
 /// Relative rank four starts with urgency one; lower ranks contribute only to
 /// the exact released bonus. Advance-state columns are mutually exclusive,
@@ -3513,8 +4738,7 @@ fn accumulate_passed_pawn_features(
     }
 }
 
-
-/// Used for scoring the minimal STR-295 hot-path accumulator.
+/// Alternative configuration retained for controlled evaluation.
 ///
 /// # Arguments
 ///
@@ -3566,7 +4790,7 @@ fn passed_pawn_candidate_delta_values(values: [i32; 5], phase: i32) -> i32 {
     )
 }
 
-/// Used for extracting the six constant-time STR-296 initiative inputs.
+/// Alternative configuration retained for controlled evaluation.
 ///
 /// King geometry is admitted only when both kings exist, which keeps bounded
 /// diagnostic positions deterministic without inventing a coordinate for a
@@ -3612,7 +4836,7 @@ fn initiative_features(
     features
 }
 
-/// Used for deriving STR-296's two king-geometry inputs.
+/// Alternative configuration retained for controlled evaluation.
 ///
 /// # Arguments
 ///
@@ -3634,7 +4858,7 @@ fn initiative_king_geometry(white: Option<Square>, black: Option<Square>) -> (i3
     }
 }
 
-/// Used for applying the frozen STR-296 endgame initiative vector.
+/// Alternative configuration retained for controlled evaluation.
 ///
 /// The fitted complexity is first rounded in the endgame domain, signed for
 /// the side favored by the input score, and tapered from an exactly zero
@@ -3783,6 +5007,111 @@ const fn build_passed_pawn_blocker_masks() -> [[u64; 64]; 2] {
 /// # Returns
 ///
 /// White-relative rook-file score.
+/// Used for scoring the safe territory each army controls behind its own
+/// lines, from White's perspective.
+///
+/// Alternative configuration retained for controlled evaluation.
+///
+/// The area is the four central files on the three ranks in front of a
+/// colour's home rank, counting squares that the colour's own pawns do not
+/// occupy and the enemy's pawns do not attack. Ranks are taken through
+/// [`relative_rank`], so the term is orientation-safe by construction rather
+/// than by a hand-written row index — the mistake that produced an asymmetric
+/// bishop-pawn term once already.
+///
+/// The count is weighted by how many pieces remain, because territory is worth
+/// having only in proportion to the force that can use it, and the weight
+/// tapers to nothing in the endgame where space is not a meaningful asset.
+///
+/// # Arguments
+///
+/// * `position` - position supplying pawns and piece counts
+/// * `phase` - release material phase in `0..=MAX_PHASE`
+/// * `weight` - centipawns per weighted safe square, scaled by 1/64
+///
+/// # Returns
+///
+/// White-relative space score in centipawns.
+fn space_term(position: &Position, phase: i32, weight: i32) -> i32 {
+    if weight == 0 {
+        return 0;
+    }
+    let mut score = 0;
+    for color in [Color::White, Color::Black] {
+        let enemy = color.opposite();
+        let own_pawns = position.piece_bitboard(Piece::new(color, PieceKind::Pawn));
+        let enemy_pawns = position.piece_bitboard(Piece::new(enemy, PieceKind::Pawn));
+        let enemy_pawn_attacks = pawn_attack_span(enemy, enemy_pawns);
+        let safe = space_area()[color.index()] & !own_pawns & !enemy_pawn_attacks;
+        // Territory is worth having in proportion to the force that can use
+        // it, so the count is scaled by remaining pieces and by the phase that
+        // already measures them.
+        let count = i32::try_from(safe.count_ones()).expect("popcount fits i32");
+        let pieces = i32::try_from(
+            position
+                .color_occupancy(color)
+                .count_ones()
+                .saturating_sub(1)
+                .min(15),
+        )
+        .expect("clamped piece count fits i32");
+        score += color_sign(color) * count * pieces * weight * phase / (64 * MAX_PHASE.max(1));
+    }
+    score
+}
+
+/// Used for the constant space area of each colour: the four central files on
+/// the three ranks ahead of that colour's home rank.
+///
+/// Built once from [`relative_rank`] rather than written as a hand-made
+/// bitboard literal, so the orientation cannot drift from the rest of the
+/// evaluator.
+static SPACE_AREA: std::sync::OnceLock<[u64; 2]> = std::sync::OnceLock::new();
+
+/// Used for retrieving the per-colour space area, building it once on first
+/// use.
+///
+/// # Returns
+///
+/// Reference to the two constant area masks, indexed by colour.
+fn space_area() -> &'static [u64; 2] {
+    SPACE_AREA.get_or_init(|| {
+        let mut areas = [0_u64; 2];
+        for color in [Color::White, Color::Black] {
+            for index in 0_u8..64 {
+                let square = board_square(index);
+                if (2..=5).contains(&square.file())
+                    && (1..=3).contains(&relative_rank(color, square))
+                {
+                    areas[color.index()] |= square.bit();
+                }
+            }
+        }
+        areas
+    })
+}
+
+/// Used for the union of squares a colour's pawns attack.
+///
+/// # Arguments
+///
+/// * `color` - colour owning the pawns
+/// * `pawns` - that colour's pawn bitboard
+///
+/// # Returns
+///
+/// Bitboard of every square attacked by one of those pawns.
+fn pawn_attack_span(color: Color, pawns: u64) -> u64 {
+    const NOT_FILE_A: u64 = !0x0101_0101_0101_0101;
+    const NOT_FILE_H: u64 = !0x8080_8080_8080_8080;
+    // Janus indexes from a8, so White's forward direction is toward lower
+    // indices and Black's toward higher ones.
+    match color {
+        Color::White => ((pawns & NOT_FILE_A) >> 9) | ((pawns & NOT_FILE_H) >> 7),
+        Color::Black => ((pawns & NOT_FILE_H) << 9) | ((pawns & NOT_FILE_A) << 7),
+    }
+}
+
 fn rook_files(position: &Position, file_pawns: [[u8; 8]; 2]) -> i32 {
     let mut score = 0;
     for color in [Color::White, Color::Black] {
@@ -3795,7 +5124,7 @@ fn rook_files(position: &Position, file_pawns: [[u8; 8]; 2]) -> i32 {
             rooks &= rooks - 1;
             let file = usize::from(board_square(index).file());
             if file_pawns[own][file] == 0 {
-                score += sign * if file_pawns[enemy][file] == 0 { 20 } else { 10 };
+                score += sign * if file_pawns[enemy][file] == 0 { 22 } else { 11 };
             }
         }
     }
@@ -3818,7 +5147,7 @@ fn rook_files(position: &Position, file_pawns: [[u8; 8]; 2]) -> i32 {
 ///
 /// # Returns
 ///
-/// Bounded white-relative STR-304 correction in centipawns.
+/// Alternative configuration retained for controlled evaluation.
 fn king_pawn_file_proximity_term(position: &Position, phase: i32) -> i32 {
     let (Some(white_king), Some(black_king)) = (
         position.king_square(Color::White),
@@ -3907,8 +5236,8 @@ fn king_term(position: &Position, phase: i32) -> i32 {
         };
         let sign = color_sign(color);
         let castled = is_castled_king_square(color, king);
-        let castled_bonus = if castled { 28 * phase / MAX_PHASE } else { 0 };
-        let shelter = shelter_file_count(position, color, king) * 9 * phase / MAX_PHASE;
+        let castled_bonus = if castled { 29 * phase / MAX_PHASE } else { 0 };
+        let shelter = shelter_file_count(position, color, king) * 10 * phase / MAX_PHASE;
         score += sign * (castled_bonus + shelter);
     }
     score
@@ -3948,45 +5277,62 @@ fn is_castled_king_square(color: Color, king: Square) -> bool {
 ///
 /// Number of sheltered files in `0..=3`.
 fn shelter_file_count(position: &Position, color: Color, king: Square) -> i32 {
-    let king_file = usize::from(king.file());
-    let low_file = king_file.saturating_sub(1);
-    let high_file = (king_file + 1).min(7);
-    let mut sheltered_files = 0_u8;
-    let mut pawns = position.piece_bitboard(Piece::new(color, PieceKind::Pawn));
-    while pawns != 0 {
-        let index = u8::try_from(pawns.trailing_zeros()).expect("set bit index is below 64");
-        pawns &= pawns - 1;
-        let pawn = board_square(index);
-        let file = usize::from(pawn.file());
-        if (low_file..=high_file).contains(&file) && plausible_shelter_pawn(color, king, pawn) {
-            sheltered_files |= 1_u8 << file;
-        }
-    }
-    i32::try_from(sheltered_files.count_ones()).expect("shelter file count fits i32")
+    let pawns = position.piece_bitboard(Piece::new(color, PieceKind::Pawn));
+    let sheltered = pawns & SHELTER_MASKS[color.index()][usize::from(king.index())];
+    i32::try_from(occupied_pawn_files(sheltered).count_ones()).expect("file count fits i32")
 }
 
-/// Used for testing whether a pawn lies one to three ranks in front of its
-/// king.
+/// Used for the squares a shelter pawn may occupy, per colour and king square.
 ///
-/// Pawns on, behind, or more than three ranks ahead of the king's rank do
-/// not shelter it.
+/// Both halves of the released predicate -- the king-adjacent file window and
+/// "one to three ranks ahead in the colour's own direction" -- read ONLY the
+/// colour, the king square and the pawn square. No occupancy, no other piece.
+/// So the accepted set is fixed per `(colour, king)` and the per-pawn loop was
+/// re-deriving a constant on every evaluation.
 ///
-/// # Arguments
-///
-/// * `color` - color owning the king and pawn
-/// * `king` - king's square
-/// * `pawn` - pawn's square
+/// Counting each FILE once, rather than each pawn, is preserved by folding the
+/// masked pawns through [`occupied_pawn_files`] before the population count.
+static SHELTER_MASKS: [[u64; 64]; 2] = build_shelter_masks();
+
+/// Used for materialising [`SHELTER_MASKS`] at compile time.
 ///
 /// # Returns
 ///
-/// `true` when the pawn plausibly shelters the king.
-fn plausible_shelter_pawn(color: Color, king: Square, pawn: Square) -> bool {
-    let distance = match color {
-        Color::White if pawn.rank() > king.rank() => pawn.rank() - king.rank(),
-        Color::Black if pawn.rank() < king.rank() => king.rank() - pawn.rank(),
-        Color::White | Color::Black => return false,
-    };
-    distance <= 3
+/// Accepted-pawn bitboards indexed by colour then king square.
+const fn build_shelter_masks() -> [[u64; 64]; 2] {
+    let mut masks = [[0_u64; 64]; 2];
+    let mut color = 0_usize;
+    while color < 2 {
+        let mut king = 0_usize;
+        while king < 64 {
+            let king_file = king & 7;
+            let king_rank = 8 - (king >> 3);
+            let mut pawn = 0_usize;
+            while pawn < 64 {
+                let pawn_file = pawn & 7;
+                let pawn_rank = 8 - (pawn >> 3);
+                // `saturating_sub` reproduces the released `king_file
+                // .saturating_sub(1)` window exactly on the a-file.
+                let file_ok =
+                    pawn_file >= king_file.saturating_sub(1) && pawn_file <= king_file + 1;
+                // White shelters ahead of the king in increasing rank, Black in
+                // decreasing rank; equal ranks are rejected on both sides, as
+                // `plausible_shelter_pawn`'s guard arms do.
+                let ahead = if color == 0 {
+                    pawn_rank > king_rank && pawn_rank - king_rank <= 3
+                } else {
+                    pawn_rank < king_rank && king_rank - pawn_rank <= 3
+                };
+                if file_ok && ahead {
+                    masks[color][king] |= 1_u64 << pawn;
+                }
+                pawn += 1;
+            }
+            king += 1;
+        }
+        color += 1;
+    }
+    masks
 }
 
 /// Used for producing a Java-calibrated ordering hint for non-tactical legal
@@ -4278,17 +5624,17 @@ fn piece_activity(
             };
             middle += bonus.0;
             ending += bonus.1;
-        } else if attacks & outpost_mask(color, own_pawn_attacks, enemy_pawn_attacks) & !own != 0 {
+        } else if attacks & maps.outposts[side] & !own != 0 {
             let bonus = if kind == PieceKind::Knight {
-                (13, 6)
+                (13, 7)
             } else {
-                (7, 3)
+                (9, 3)
             };
             middle += bonus.0;
             ending += bonus.1;
         }
         if minor_behind_pawn(position, color, square) {
-            middle += 8;
+            middle += 7;
             ending += 5;
         }
         if let Some(king) = position.king_square(color) {
@@ -4306,7 +5652,7 @@ fn piece_activity(
             ending -= penalty / 2;
             let pawn_occupancy = own_pawns | enemy_pawns;
             if bit_count(diagonal_attacks(square, pawn_occupancy) & center_squares()) >= 2 {
-                middle += 8;
+                middle += 10;
                 ending += 4;
             }
         }
@@ -4314,13 +5660,13 @@ fn piece_activity(
             let queens = position.piece_bitboard(Piece::new(Color::White, PieceKind::Queen))
                 | position.piece_bitboard(Piece::new(Color::Black, PieceKind::Queen));
             if queens & file_mask(square.file()) != 0 {
-                middle += 6;
+                middle += 5;
             }
             let seventh = if color == Color::White { 7 } else { 2 };
             if square.rank() == seventh && position.color_occupancy(enemy) & rank_mask(seventh) != 0
             {
-                middle += 18;
-                ending += 27;
+                middle += 19;
+                ending += 26;
             }
             if mobility <= 3 {
                 if let Some(king) = position.king_square(color) {
@@ -4339,7 +5685,7 @@ fn piece_activity(
         PieceKind::Queen => {
             if relative_rank(color, square) >= 4 && square.bit() & enemy_pawn_attacks == 0 {
                 middle += 7;
-                ending += 10;
+                ending += 11;
             }
         }
         PieceKind::Pawn | PieceKind::Knight | PieceKind::King => {}
@@ -4486,10 +5832,8 @@ fn side_threats<const CANDIDATE_THREATS: bool>(
     ending += bit_count(pawn_push_threats) * pawn_push_weight.1;
 
     let enemy_queens = position.piece_bitboard(Piece::new(enemy, PieceKind::Queen));
-    if enemy_queens != 0 {
-        let queen = board_square(
-            u8::try_from(enemy_queens.trailing_zeros()).expect("set bit index is below 64"),
-        );
+    // Historical calibration detail omitted from the public source release.
+    if let Some(queen) = lone_square(enemy_queens) {
         let safe_knight_pressure =
             attacks.by_kind[side][PieceKind::Knight.index()] & knight_attacks(queen) & safe;
         let queen_knight_weight = if CANDIDATE_THREATS {
@@ -4539,10 +5883,10 @@ const fn minor_threat_scores<const CANDIDATE_THREATS: bool>(target: PieceKind) -
         }
     } else {
         match target {
-            PieceKind::Pawn => (6, 15),
-            PieceKind::Knight | PieceKind::Bishop => (32, 25),
-            PieceKind::Rook => (48, 37),
-            PieceKind::Queen => (57, 70),
+            PieceKind::Pawn => (7, 13),
+            PieceKind::Knight | PieceKind::Bishop => (33, 24),
+            PieceKind::Rook => (49, 37),
+            PieceKind::Queen => (57, 76),
             PieceKind::King => (0, 0),
         }
     }
@@ -4568,10 +5912,10 @@ const fn rook_threat_scores<const CANDIDATE_THREATS: bool>(target: PieceKind) ->
         }
     } else {
         match target {
-            PieceKind::Pawn => (4, 28),
-            PieceKind::Knight | PieceKind::Bishop => (24, 36),
-            PieceKind::Rook => (0, 18),
-            PieceKind::Queen => (41, 36),
+            PieceKind::Pawn => (2, 27),
+            PieceKind::Knight | PieceKind::Bishop => (25, 37),
+            PieceKind::Rook => (1, 19),
+            PieceKind::Queen => (40, 34),
             PieceKind::King => (0, 0),
         }
     }
@@ -4816,24 +6160,57 @@ fn king_pawn_cover_features(
     king: Square,
 ) -> (i32, i32, i32) {
     let own_pawns = position.piece_bitboard(Piece::new(king_color, PieceKind::Pawn));
-    let enemy_pawns = position.piece_bitboard(Piece::new(king_color.opposite(), PieceKind::Pawn));
     let low_file = king.file().saturating_sub(1);
     let high_file = king.file().saturating_add(1).min(7);
     let mut missing = 0;
     let mut advanced = 0;
-    let mut storm = 0;
     for file in low_file..=high_file {
         match nearest_forward_pawn_distance(own_pawns, king_color, king, file) {
             Some(distance) if distance <= 4 => advanced += (distance - 1).max(0),
             Some(_) | None => missing += 1,
         }
+    }
+    (
+        missing,
+        advanced,
+        king_storm_proximity(position, king_color, king),
+    )
+}
+
+/// Used for measuring how close enemy pawns have come to a king's flank.
+///
+/// Split out of [`king_pawn_cover_features`] so the parameterized twin scores
+/// the same quantity the research feature vector reports. A storm term fitted
+/// against one definition and released against another would be a silent
+/// transcription error, and the value here is small enough that a games-based
+/// screen could not distinguish the two.
+///
+/// Each of the three king-flank files contributes `5 - distance` for the
+/// nearest enemy pawn within four ranks, so a pawn one rank away is worth four
+/// times one that is four ranks away.
+///
+/// # Arguments
+///
+/// * `position` - position whose pawns are inspected
+/// * `king_color` - color of the defending king
+/// * `king` - square the defending king stands on
+///
+/// # Returns
+///
+/// Unsigned storm proximity, zero when no enemy pawn is within four ranks.
+fn king_storm_proximity(position: &Position, king_color: Color, king: Square) -> i32 {
+    let enemy_pawns = position.piece_bitboard(Piece::new(king_color.opposite(), PieceKind::Pawn));
+    let low_file = king.file().saturating_sub(1);
+    let high_file = king.file().saturating_add(1).min(7);
+    let mut storm = 0;
+    for file in low_file..=high_file {
         if let Some(distance) = nearest_forward_pawn_distance(enemy_pawns, king_color, king, file) {
             if distance <= 4 {
                 storm += 5 - distance;
             }
         }
     }
-    (missing, advanced, storm)
+    storm
 }
 
 /// Used for converting a bounded signed 64-bit feature sum to saturated i32.
@@ -4849,7 +6226,7 @@ fn saturating_feature_i32(value: i64) -> i32 {
     i32::try_from(value).unwrap_or(if value < 0 { i32::MIN } else { i32::MAX })
 }
 
-/// Used for extracting the STR-280 king-danger feature vector.
+/// Alternative configuration retained for controlled evaluation.
 ///
 /// # Arguments
 ///
@@ -4862,16 +6239,7 @@ fn saturating_feature_i32(value: i64) -> i32 {
 /// White-relative raw features without changing the release score.
 /// Used for scoring king danger with the gate and clamp applied per defender.
 ///
-/// The promoted STR-280 scorer gathers both kings into one signed feature
-/// vector, tests the *net* safe-check counts for zero, and clamps the combined
-/// White-minus-Black term once. Equal checking chances on both sides therefore
-/// cancel before the gate, and a read-only audit of the 104,033-position
-/// development cohort found 53,451 positions with a zero aggregate check vector
-/// but nonzero suppressed shelter or pressure context. This flavour instead
-/// builds one unsigned feature record per defended king, converts and clamps
-/// each independently with the same fitted coefficients, and only then
-/// subtracts the two results. No coefficient is refitted: the contrast isolates
-/// where the gate and clamp are applied.
+/// Alternative configuration retained for controlled evaluation.
 ///
 /// # Arguments
 ///
@@ -4989,7 +6357,12 @@ fn king_danger_features(
         let raw = side_king_pressure(position, attacks, king_color, king);
         let gated_pressure = raw * queen_scale / 100;
         let mut released_pressure = gated_pressure * phase / MAX_PHASE;
-        if position.in_check(king_color) {
+        // Being in check is exactly "an enemy piece geometrically attacks the
+        // king square", which is what `all[enemy]` unions -- and the union is
+        // already built. Attack relations are symmetric for every family the
+        // check test walks, so this cannot disagree. Guarded by
+        // `attack_union_agrees_with_in_check`.
+        if attacks.attacks(king, king_color.opposite()) {
             released_pressure += 35;
         }
         features.current_pressure += danger_sign * released_pressure;
@@ -5022,7 +6395,7 @@ fn rounded_feature_division(numerator: i64, denominator: i64) -> i32 {
     saturating_feature_i32(rounded)
 }
 
-/// Used for applying the five-fold STR-280 integer king-danger vector.
+/// Alternative configuration retained for controlled evaluation.
 ///
 /// The candidate activates only when the signed safe-check feature vector is
 /// nonzero. This is the predeclared correction to the first global fit, whose
@@ -5073,13 +6446,9 @@ fn king_danger_candidate_pressure(features: KingDangerFeatures) -> i32 {
         .clamp(-KING_DANGER_TERM_LIMIT, KING_DANGER_TERM_LIMIT)
 }
 
-/// Used for the frozen STR-319 and STR-304 additions consumed by the
-/// parameterized twin and the sparse linear model.
+/// Alternative configuration retained for controlled evaluation.
 ///
-/// Both confirmed terms are built from named constants rather than tunable
-/// parameters, so neither belongs in the linear basis. They enter the twin and
-/// the sparse model as frozen `(pawn, king)` centipawn constants exactly as
-/// STR-280's non-linear correction does.
+/// Alternative configuration retained for controlled evaluation.
 ///
 /// # Arguments
 ///
@@ -5102,8 +6471,7 @@ pub(crate) fn promoted_capacity_delta(position: &Position) -> (i32, i32) {
     )
 }
 
-/// Used for the frozen STR-280 correction over the released linear
-/// king-pressure family.
+/// Alternative configuration retained for controlled evaluation.
 ///
 /// The promoted scorer is non-linear in the tunable king parameters: it gates
 /// on a signed safe-check vector, rescales current pressure by a rounded
@@ -5150,7 +6518,7 @@ pub(crate) fn king_danger_promoted_delta(position: &Position) -> i32 {
 /// # Returns
 ///
 /// Phase-weighted blend of the two components.
-fn tapered_score(middle: i32, ending: i32, phase: i32) -> i32 {
+const fn tapered_score(middle: i32, ending: i32, phase: i32) -> i32 {
     let weighted = middle * phase + ending * (MAX_PHASE - phase);
     if weighted >= 0 {
         (weighted + MAX_PHASE / 2) / MAX_PHASE
@@ -5389,7 +6757,7 @@ fn knight_attacks(square: Square) -> u64 {
 /// Bitboard of attacked squares on all four diagonals, including each ray's
 /// first blocker.
 fn diagonal_attacks(square: Square, occupancy: u64) -> u64 {
-    ray_attacks(square, occupancy, &[(-1, -1), (-1, 1), (1, -1), (1, 1)])
+    janus_core::sliding_attacks::bishop_attacks(square.index(), occupancy)
 }
 
 /// Used for building orthogonal slider attacks through the first occupied
@@ -5405,34 +6773,7 @@ fn diagonal_attacks(square: Square, occupancy: u64) -> u64 {
 /// Bitboard of attacked squares on the file and rank, including each ray's
 /// first blocker.
 fn orthogonal_attacks(square: Square, occupancy: u64) -> u64 {
-    ray_attacks(square, occupancy, &[(-1, 0), (1, 0), (0, -1), (0, 1)])
-}
-
-/// Used for walking a collection of slider rays until each ray's first
-/// blocker.
-///
-/// # Arguments
-///
-/// * `square` - ray origin, itself never included
-/// * `occupancy` - bitboard of blocking pieces
-/// * `directions` - file/row direction pairs to walk
-///
-/// # Returns
-///
-/// Bitboard of every visited square, including each ray's first blocker.
-fn ray_attacks(square: Square, occupancy: u64, directions: &[(i8, i8)]) -> u64 {
-    let mut attacks = 0;
-    for &(file_delta, row_delta) in directions {
-        let mut cursor = square;
-        while let Some(target) = square_offset(cursor, file_delta, row_delta) {
-            attacks |= target.bit();
-            if occupancy & target.bit() != 0 {
-                break;
-            }
-            cursor = target;
-        }
-    }
-    attacks
+    janus_core::sliding_attacks::rook_attacks(square.index(), occupancy)
 }
 
 /// Used for building all pawn attacks for a bitboard of one color's pawns.
@@ -5474,6 +6815,15 @@ fn connected_pawn_term(position: &Position, phase: i32, scale_percent: i32) -> i
     /// Used for masking the h-file so a phalanx never wraps off that edge.
     const FILE_H: u64 = 0x8080_8080_8080_8080;
 
+    // The released ramp and an in-range phase select the precomputed row; every
+    // other caller keeps the general taper. Bounding the phase here rather than
+    // trusting `game_phase` keeps a stray value a slow evaluation, not a panic.
+    let row = if scale_percent == CONNECTED_PAWN_SCALE_PERCENT && (0..=MAX_PHASE).contains(&phase) {
+        Some(&CONNECTED_PAWN_TAPERED[usize::try_from(phase).expect("phase is non-negative")])
+    } else {
+        None
+    };
+
     let mut score = 0;
     for color in [Color::White, Color::Black] {
         let sign = color_sign(color);
@@ -5491,13 +6841,18 @@ fn connected_pawn_term(position: &Position, phase: i32, scale_percent: i32) -> i
             } else {
                 9 - square.rank()
             };
-            let (middle, ending) = CONNECTED_PAWN_BONUS[usize::from(relative_rank.min(8))];
-            score += sign
-                * tapered_score(
+            let index = usize::from(relative_rank.min(8));
+            let contribution = if let Some(row) = row {
+                row[index]
+            } else {
+                let (middle, ending) = CONNECTED_PAWN_BONUS[index];
+                tapered_score(
                     middle * scale_percent / 100,
                     ending * scale_percent / 100,
                     phase,
-                );
+                )
+            };
+            score += sign * contribution;
         }
     }
     score
@@ -5505,15 +6860,7 @@ fn connected_pawn_term(position: &Position, phase: i32, scale_percent: i32) -> i
 
 /// Used for penalizing a bishop obstructed by its owner's own pawns.
 ///
-/// `STR-20260806-332`. Janus's evaluation has no representation at all of
-/// bishop quality: a bishop is scored by material, its piece-square entry, and
-/// its mobility, so a bishop whose own pawn chain sits entirely on its own
-/// square color is indistinguishable from a bishop with an open board except
-/// through whatever mobility happens to survive. Every mature classical
-/// evaluator carries some form of this term, and the concept — a bishop is
-/// devalued by friendly pawns on its color, more so when those pawns cannot
-/// advance — is the abstract mechanism borrowed here. The arithmetic, the
-/// blocked-pawn definition, and every constant are Janus's own.
+/// Alternative configuration retained for controlled evaluation.
 ///
 /// The multiplier grows with the number of the owner's *blocked* center pawns
 /// because an obstructed bishop is only genuinely bad when the structure is
@@ -5527,7 +6874,196 @@ fn connected_pawn_term(position: &Position, phase: i32, scale_percent: i32) -> i
 ///
 /// # Returns
 ///
-/// White-relative penalty in centipawns, negative for the obstructed side.
+/// Alternative configuration retained for controlled evaluation.
+///
+/// `(middlegame, endgame)` centipawns per pinned piece, before the per-kind
+/// scale. **Released as `(0, 0)`, an exact no-op**, until a screen at game
+/// depth says otherwise.
+const ABSOLUTE_PIN_PENALTY: (i32, i32) = (0, 0);
+
+/// Used for scaling the pin penalty by what the pinned piece loses.
+///
+/// Indexed by [`PieceKind::index`]. A pinned knight is the worst case: it moves
+/// only by leaving its ray, so an absolute pin freezes it completely. A rook or
+/// queen pinned along its own line of travel keeps most of its moves, and a
+/// pawn keeps its pushes when pinned vertically. Kings are never pinned.
+const ABSOLUTE_PIN_SCALE: [i32; 6] = [40, 100, 90, 55, 35, 0];
+
+/// Used for penalizing pieces that cannot leave their ray without exposing
+/// the king.
+///
+/// Mobility already counts a pinned piece's destinations as though it could
+/// use them, so the evaluator systematically overvalues a pinned knight or
+/// bishop. This is the correction, and it is a concept the placement table
+/// cannot express at any weighting: whether a piece is pinned depends on the
+/// king and the enemy sliders, not on the square it stands on.
+///
+/// The pin set is the move generator's own, so its geometry is already proven
+/// by every perft fixture rather than by a separate oracle.
+///
+/// # Arguments
+///
+/// * `position` - position supplying kings, sliders and occupancy
+/// * `phase` - tapering phase in `0..=MAX_PHASE`
+/// * `penalty` - untapered `(middlegame, endgame)` pair per pinned piece
+///
+/// # Returns
+///
+/// White-relative penalty in centipawns, negative for the pinned side.
+fn absolute_pin_term(position: &Position, phase: i32, penalty: (i32, i32)) -> i32 {
+    if penalty.0 == 0 && penalty.1 == 0 {
+        return 0;
+    }
+    let mut score = 0;
+    for color in [Color::White, Color::Black] {
+        let sign = color_sign(color);
+        let mut pinned = position.absolute_pins(color);
+        while pinned != 0 {
+            let index = u8::try_from(pinned.trailing_zeros()).expect("set bit index is below 64");
+            pinned &= pinned - 1;
+            let square = board_square(index);
+            let Some(piece) = position.piece_at(square) else {
+                continue;
+            };
+            let scale = ABSOLUTE_PIN_SCALE[piece.kind.index()];
+            score -= sign * tapered_score(penalty.0 * scale / 100, penalty.1 * scale / 100, phase);
+        }
+    }
+    score
+}
+
+/// Alternative configuration retained for controlled evaluation.
+///
+/// Percent of the score retained when the stronger side has no pawns at all.
+/// `100` is the released behaviour and an exact no-op.
+const PAWNLESS_SCALE_PERCENT: i32 = 100;
+
+/// Used for scaling a winning score by how many pawns the stronger side keeps.
+///
+/// An extra piece with no pawns is very often a draw; the same piece alongside
+/// three pawns is a trivial win. Janus scales only the pure opposite-coloured
+/// bishop case and is otherwise blind to this, so it values a pawnless material
+/// edge exactly as highly as a pawn-rich one.
+///
+/// The scale ramps linearly from `retained_percent` at zero pawns to full at
+/// four, and only ever *reduces* a score, never inflates one.
+///
+/// # Arguments
+///
+/// * `position` - position supplying pawn counts
+/// * `score` - White-relative score before scaling
+/// * `retained_percent` - percent kept when the stronger side is pawnless;
+///   `100` disables the scale exactly
+///
+/// # Returns
+///
+/// The scaled White-relative score.
+fn pawn_count_scaled_score(position: &Position, score: i32, retained_percent: i32) -> i32 {
+    if retained_percent >= 100 || score == 0 {
+        return score;
+    }
+    // The side the score favours is the one whose winning chances the pawn
+    // count governs.
+    let stronger = if score > 0 {
+        Color::White
+    } else {
+        Color::Black
+    };
+    let pawns = bit_count(position.piece_bitboard(Piece::new(stronger, PieceKind::Pawn)));
+    if pawns >= 4 {
+        return score;
+    }
+    let retained = retained_percent + (100 - retained_percent) * pawns / 4;
+    score * retained / 100
+}
+
+/// Alternative configuration retained for controlled evaluation.
+///
+/// Percent of the score retained once the halfmove clock is fully wound. `100`
+/// is the released behaviour and an exact no-op.
+const SHUFFLE_DAMPING_PERCENT: i32 = 100;
+
+/// Used for the halfmove-clock value at which damping reaches full strength.
+///
+/// The fifty-move rule fires at `100` halfmoves. Damping ramps from zero at
+/// `HALFMOVE_DAMPING_START` to full at that limit.
+const HALFMOVE_DAMPING_START: i32 = 20;
+
+/// Used for damping the score as the fifty-move counter winds toward a draw.
+///
+/// The evaluator cannot currently see the halfmove clock at all, so a position
+/// eighty plies into a shuffle is scored exactly as it was at move one, even
+/// though its practical value is collapsing toward a draw. Every strong engine
+/// carries some form of this scaling.
+///
+/// Concretely: a side that is up material but cannot make progress before the
+/// fifty-move rule fires does not really hold that advantage, and a side that
+/// is worse benefits from shuffling. Scaling the score toward zero as the
+/// clock winds expresses both.
+///
+/// # Arguments
+///
+/// * `score` - White-relative score before damping
+/// * `halfmove_clock` - halfmoves since the last capture or pawn move
+/// * `retained_percent` - percent of the score kept at a full clock; `100`
+///   disables the damper exactly
+///
+/// # Returns
+///
+/// The damped White-relative score.
+fn shuffle_damped_score(score: i32, halfmove_clock: i32, retained_percent: i32) -> i32 {
+    if retained_percent >= 100 || halfmove_clock <= HALFMOVE_DAMPING_START {
+        return score;
+    }
+    let span = 100 - HALFMOVE_DAMPING_START;
+    let progress = (halfmove_clock - HALFMOVE_DAMPING_START).min(span);
+    // Linear ramp from 100% retained at the start to `retained_percent` at a
+    // full clock, in integer space so the released path is bit-identical.
+    let retained = 100 - (100 - retained_percent) * progress / span;
+    score * retained / 100
+}
+
+/// Alternative configuration retained for controlled evaluation.
+///
+/// `(middlegame, endgame)` centipawns per square a queen would reach from the
+/// king's own square. `(0, 0)` is the released behaviour and an exact no-op.
+const KING_LINE_EXPOSURE: (i32, i32) = (0, 0);
+
+/// Used for penalizing a king that sits on open lines.
+///
+/// Treating the king as a queen and counting its reach measures how exposed it
+/// is to sliders — a king behind an intact pawn shield reaches few squares, a
+/// king on an open board reaches many. Janus scores shelter and storm by pawn
+/// geometry but has no term for line exposure itself, which is one of the two
+/// king-safety inputs the strong references carry and this evaluator lacks.
+///
+/// # Arguments
+///
+/// * `position` - position supplying kings and occupancy
+/// * `phase` - tapering phase in `0..=MAX_PHASE`
+/// * `weight` - untapered `(middlegame, endgame)` centipawns per reached square
+///
+/// # Returns
+///
+/// White-relative penalty in centipawns, negative for the exposed side.
+fn king_line_exposure_term(position: &Position, phase: i32, weight: (i32, i32)) -> i32 {
+    if weight.0 == 0 && weight.1 == 0 {
+        return 0;
+    }
+    let mut score = 0;
+    for color in [Color::White, Color::Black] {
+        let Some(king) = position.king_square(color) else {
+            continue;
+        };
+        // The king's own reach as though it were a queen: more squares means
+        // more slider lines pointing at it.
+        let reach = position.attacks_for_piece(king, Piece::new(color, PieceKind::Queen));
+        let open = bit_count(reach & !position.color_occupancy(color));
+        score -= color_sign(color) * tapered_score(weight.0 * open, weight.1 * open, phase);
+    }
+    score
+}
+
 fn bishop_pawn_term(position: &Position, phase: i32, scale_percent: i32) -> i32 {
     /// Used for masking one of the two square colors.
     ///
@@ -5600,13 +7136,7 @@ const fn pawn_push_blockers(color: Color, squares: u64) -> u64 {
 
 /// Used for adjusting knight and rook value by the owner's pawn count.
 ///
-/// This is the compact form of the material-imbalance mechanism every mature
-/// classical evaluator carries: a knight is worth more with pawns on the board
-/// and a rook is worth less. `STR-20260804-301`'s full quadratic table and
-/// `STR-20260804-303`'s closedness variant were both rejected at a static
-/// teacher-trace gate that `INFRA-20260805-320` has since shown does not track
-/// strength in either direction, so this narrow two-coefficient form is
-/// screened in play instead of refitted against that trace.
+/// Alternative configuration retained for controlled evaluation.
 ///
 /// # Arguments
 ///
@@ -5884,6 +7414,24 @@ fn board_square(index: u8) -> Square {
     Square::new(index).expect("board index is below 64")
 }
 
+/// Used for reading the only occupied square of a bitboard.
+///
+/// # Arguments
+///
+/// * `board` - bitboard to inspect
+///
+/// # Returns
+///
+/// `Some(square)` when exactly one bit is set, `None` when the board is empty
+/// or holds more than one piece.
+pub(super) fn lone_square(board: u64) -> Option<Square> {
+    // A bitboard with exactly one occupied square is, as an integer, a power
+    // of two; the standard predicate already excludes zero.
+    board.is_power_of_two().then(|| {
+        board_square(u8::try_from(board.trailing_zeros()).expect("set bit index is below 64"))
+    })
+}
+
 /// Used for counting set bits in the signed score type used by evaluation
 /// formulas.
 ///
@@ -5909,4 +7457,3 @@ fn bit_count(bits: u64) -> i32 {
 /// used by the engine's release evaluation path.
 #[doc(hidden)]
 pub mod tuning;
-

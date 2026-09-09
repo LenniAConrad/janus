@@ -197,4 +197,3 @@ pub const fn terminal_score(in_check: bool, ply: u16) -> i32 {
         0
     }
 }
-

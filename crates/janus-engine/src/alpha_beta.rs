@@ -15,8 +15,9 @@ use crate::score::{
     MATE_THRESHOLD, TB_WIN_SCORE,
 };
 use crate::search_math::{
-    late_move_prune_threshold, lmr_reduction, lmr_reduction_units, null_move_reduction,
-    stability_budget_millis, LMR_UNIT,
+    falling_eval_budget_millis, late_move_prune_threshold_scaled, lmr_reduction,
+    lmr_reduction_units, null_move_reduction_tuned, stability_budget_millis, LMR_UNIT,
+    RELEASED_NULL_MOVE_BASE, RELEASED_NULL_MOVE_DEPTH_DIVISOR,
 };
 use crate::syzygy::{Prober, SyzygyConfig};
 use crate::tt::{Bound, SharedTranspositionTable, TranspositionTable, TtHit, TtPayload};
@@ -48,10 +49,7 @@ const STOP_CHECK_EVERY_NODE_UNTIL: u64 = 512;
 /// Used for capping the soft clock target, in milliseconds, when the root has
 /// exactly one legal reply.
 ///
-/// A forced reply gains nothing from a full soft allocation, so the soft
-/// target shrinks to at most this cap (2026-07-24, TIME-178). The hard
-/// deadline and all fixed-node and fixed-depth budgets stay untouched, so the
-/// cap only applies where a soft budget exists.
+/// Alternative configuration retained for controlled evaluation.
 const SINGLE_REPLY_SOFT_CAP_MILLIS: u64 = 50;
 /// Used for sizing a standalone searcher's default transposition table in
 /// entries.
@@ -160,12 +158,7 @@ const CORRECTION_GRAIN: i32 = 32;
 const CORRECTION_BONUS_DIVISOR: i32 = 4;
 /// Correction-history flavor selected for one searcher.
 ///
-/// Correction history records how far a completed search moved away from the
-/// static evaluation for a given pawn structure, then applies the learned
-/// residual to later static evaluations of positions sharing that structure.
-/// It is a search-side repair for a systematically biased evaluator, which is
-/// exactly Janus's measured situation: `INFRA-20260805-318` attributes about
-/// `793` Elo of an equal-node contrast to the evaluator alone.
+/// Alternative configuration retained for controlled evaluation.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum CorrectionHistoryMode {
     /// Released behavior: static evaluations are used exactly as produced.
@@ -176,6 +169,17 @@ pub enum CorrectionHistoryMode {
     /// Research candidate: correct by pawn structure and by each side's
     /// non-pawn material placement.
     PawnAndNonPawn,
+    /// Research candidate: the three structural tables plus a fourth keyed by
+    /// the placement of both sides' major pieces.
+    ///
+    /// Alternative configuration retained for controlled evaluation.
+    PawnNonPawnAndMajor,
+    /// Research candidate: the three structural tables plus a fourth keyed by
+    /// the *path* — the two preceding move contexts — rather than by the
+    /// position.
+    ///
+    /// Alternative configuration retained for controlled evaluation.
+    PawnNonPawnAndContinuation,
 }
 
 impl CorrectionHistoryMode {
@@ -199,6 +203,7 @@ impl CorrectionHistoryMode {
             Self::Off => 0,
             Self::Pawn => 1,
             Self::PawnAndNonPawn => 3,
+            Self::PawnNonPawnAndMajor | Self::PawnNonPawnAndContinuation => 4,
         }
     }
 }
@@ -210,18 +215,495 @@ impl CorrectionHistoryMode {
 /// without any research flavor. The flavors are grouped in one value rather
 /// than spread across the searcher so adding the next one does not widen every
 /// construction site again.
-#[derive(Clone, Copy, Debug, Default)]
+///
+/// Four of the fields are independent booleans, which `clippy` flags as a
+/// state-machine smell. That is right in general and wrong here: each selects
+/// one released-versus-research behaviour, they are deliberately combinable —
+/// several screens run two at once — and collapsing them into an enum would
+/// forbid exactly the combinations the screens need.
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Clone, Copy, Debug)]
 pub struct ResearchSearch {
     /// Used for selecting which structural correction tables the search
     /// consults and updates.
     pub correction: CorrectionHistoryMode,
-    /// Used for selecting `STR-20260806-335`'s evaluation-independent
-    /// late-move pruning.
+    /// Alternative configuration retained for controlled evaluation.
     ///
     /// `false` is the released behavior. Setting it removes the static-
     /// evaluation precondition from the late-move prune, leaving the move
     /// count and history conditions in force.
     pub eval_free_late_move_pruning: bool,
+    /// Used for scaling every centipawn-denominated pruning margin.
+    ///
+    /// Alternative configuration retained for controlled evaluation.
+    pub margin_scale_percent: i32,
+    /// Used for denominating quiescence delta pruning in evaluator units.
+    ///
+    /// Alternative configuration retained for controlled evaluation.
+    pub reconciled_delta_material: bool,
+    /// Used for denominating `ProbCut`'s capture gate in evaluator units.
+    ///
+    /// Alternative configuration retained for controlled evaluation.
+    pub reconciled_probcut_see: bool,
+    /// Used for scaling the applied structural correction.
+    ///
+    /// `100` is the released behaviour. The correction constants — grain,
+    /// saturation limit, per-update cap — were taken from the reference
+    /// engines and have never been tuned for Janus, whose evaluation is far
+    /// weaker than any of theirs. A cell saturates at
+    /// `CORRECTION_LIMIT / CORRECTION_GRAIN` = 32 centipawns; if the released
+    /// evaluator's systematic bias per pawn structure is larger than that, the
+    /// mechanism is clipping its own signal and a higher gain recovers it.
+    pub correction_gain_percent: i32,
+    /// Alternative configuration retained for controlled evaluation.
+    ///
+    /// Alternative configuration retained for controlled evaluation.
+    pub clear_correction_each_search: bool,
+    /// Used for setting the null-move reduction's constant base in plies.
+    ///
+    /// [`RELEASED_NULL_MOVE_BASE`] is the released behaviour.
+    pub null_move_base: u8,
+    /// Used for setting how many plies of depth buy one further ply of
+    /// null-move reduction.
+    ///
+    /// Alternative configuration retained for controlled evaluation.
+    pub null_move_depth_divisor: u8,
+    /// Used for setting the deepest node at which reverse futility may return.
+    ///
+    /// [`REVERSE_FUTILITY_MAX_DEPTH`] is the released behaviour; Stockfish 11
+    /// applies the same mechanism to `depth < 7`.
+    pub reverse_futility_max_depth: i32,
+    /// Used for setting the deepest node at which forward futility may skip a
+    /// quiet move.
+    ///
+    /// [`FUTILITY_MAX_DEPTH`] is the released behaviour; Stockfish 11 applies
+    /// the same mechanism to `lmrDepth < 7`. This deliberately does *not*
+    /// move the losing-capture prune, which shares the released constant but
+    /// is a different mechanism, so the flavour isolates forward futility.
+    pub futility_max_depth: i32,
+    /// Used for setting the deepest node at which late-move pruning may skip a
+    /// quiet move.
+    ///
+    /// Alternative configuration retained for controlled evaluation.
+    ///
+    /// Raising this alone reproduces the release exactly, because
+    /// [`late_move_prune_threshold_scaled`] binds first — see that function.
+    pub late_move_pruning_max_depth: i32,
+    /// Used for scaling the searched-quiet count after which late-move pruning
+    /// may begin.
+    ///
+    /// `100` is the released `3 + depth^2`. This, not the depth cap, is the
+    /// constraint that actually binds on late-move pruning: the released
+    /// quadratic demands more quiet moves than a typical position offers well
+    /// before the cap is reached, so the mechanism switches itself off around
+    /// depth five regardless of what the cap permits.
+    pub late_move_pruning_threshold_percent: i32,
+    /// Alternative configuration retained for controlled evaluation.
+    ///
+    /// Alternative configuration retained for controlled evaluation.
+    pub counter_move_ordering: bool,
+    /// Used for separating butterfly history by mover colour.
+    ///
+    /// `false` is the released behaviour, a `64 x 64` table shared by both
+    /// sides. Capture and continuation history already separate colour; this
+    /// table is the only one that does not, so White's and Black's quiet
+    /// statistics contaminate each other on every source-destination pair both
+    /// can produce.
+    pub colored_history: bool,
+    /// Used for penalising quiet moves that were tried before the cutoff.
+    ///
+    /// `false` is the released behaviour, which rewards the cutting move in
+    /// butterfly history and records nothing about the quiets that failed
+    /// ahead of it. Continuation history already applies exactly this malus,
+    /// so the butterfly table is the only quiet statistic that learns from
+    /// successes alone.
+    pub history_malus: bool,
+    /// Used for scaling the evaluator's quiet ordering prior.
+    ///
+    /// Alternative configuration retained for controlled evaluation.
+    pub quiet_order_prior_percent: i32,
+    /// Used for scaling the continuation-history contribution to quiet
+    /// ordering.
+    ///
+    /// `100` is the released behaviour.
+    pub quiet_order_continuation_percent: i32,
+    /// Used for the razoring base margin in centipawns.
+    ///
+    /// Paired with [`ResearchSearch::razor_scale`]; both are zero in the
+    /// released search, which has no razoring at all.
+    pub razor_base: i32,
+    /// Used for scaling razoring's quadratic depth margin.
+    ///
+    /// `0` is the released behaviour. A node whose static evaluation is below
+    /// `alpha - base - scale * depth^2` returns its quiescence value instead
+    /// of being searched.
+    pub razor_scale: i32,
+    /// Used for scaling a depth-proportional exchange margin on captures.
+    ///
+    /// `0` is the released behaviour, which discards a capture only when its
+    /// exchange is outright losing and only at `depth <= FUTILITY_MAX_DEPTH`,
+    /// so from depth four upward no capture is ever pruned. Stockfish prunes a
+    /// capture at *every* depth unless `see_ge(move, -177 * depth)`, growing
+    /// its tolerance with depth rather than switching off.
+    ///
+    /// When set, a capture whose exchange balance falls below
+    /// `-scale * depth` is discarded at any depth.
+    pub capture_see_prune_scale: i32,
+    /// Used for scaling futility pruning of captures.
+    ///
+    /// `0` is the released behaviour, which never applies futility to a
+    /// capture. Stockfish does, at shallow reduced depth: a capture is
+    /// discarded when `staticEval + 234 + 247 * lmrDepth + victim` still fails
+    /// to reach alpha. A capture that cannot bridge the gap even after winning
+    /// its victim is not worth a node.
+    pub capture_futility_scale: i32,
+    /// Used for measuring what move ordering costs, by not doing it.
+    ///
+    /// `false` is the released behaviour. When set, every non-transposition
+    /// move scores zero, so `order_moves` still sorts but computes nothing:
+    /// no history lookups, no exchange simulations, no evaluator calls. The
+    /// resulting search is much weaker and its tree is meaningless, but its
+    /// **nanoseconds per node** are not, and the gap against the release is
+    /// what move ordering costs.
+    ///
+    /// Alternative configuration retained for controlled evaluation.
+    pub flat_move_order: bool,
+    /// Used for restoring the horizon mate scan that ran before the stand pat.
+    ///
+    /// `false` is the released behaviour. A quiescence node that is not in
+    /// check evaluates itself and takes the beta cutoff **before** it
+    /// generates a move, which is what Stockfish, Ethereal and Berserk all do
+    /// — `search.cpp` computes `bestValue` and returns on `bestValue >= beta`
+    /// several statements above the first `MovePicker`.
+    ///
+    /// Janus used to do the opposite at every horizon node: generate the full
+    /// legal move list, then make and unmake **every** move looking for a mate
+    /// in one, and only then evaluate. The stand pat is the common outcome in
+    /// quiescence, so that scan was usually built and thrown away unused.
+    ///
+    /// Setting this back to `true` reinstates the old order. It is not free of
+    /// consequence: a horizon node holding a mate in one used to report
+    /// `MATE_SCORE - ply - 1` even when its static score already exceeded
+    /// `beta`, and now reports the static score. Both are lower bounds on a
+    /// fail-high node, so either is sound, but the trees differ.
+    pub legacy_horizon_before_stand_pat: bool,
+    /// Used for restoring the horizon mate-in-one scan.
+    ///
+    /// Alternative configuration retained for controlled evaluation.
+    ///
+    /// No engine in the reference tree does this. Stockfish, Ethereal and
+    /// Berserk all hand quiescence a captures-only move picker and accept that
+    /// a quiet mate at the horizon is invisible until the next iteration
+    /// deepens onto it.
+    ///
+    /// Alternative configuration retained for controlled evaluation.
+    pub horizon_mate_scan: bool,
+    /// Used for probing and storing the transposition table at every
+    /// quiescence ply rather than only at the entry ply.
+    ///
+    /// `false` is the released behaviour: `qply == 0` gates both the probe and the
+    /// quiescence store, so a position reached three captures
+    /// deep is evaluated from scratch every time any line transposes onto it.
+    ///
+    /// Stockfish reads and writes the table at every quiescence node, which is
+    /// where a large part of quiescence's transposition benefit comes from:
+    /// capture sequences converge on the same positions by many orders.
+    pub quiescence_tt_all_plies: bool,
+    /// Used for setting the minimum depth at which a node with no
+    /// transposition move loses a ply, or `0` to disable the reduction.
+    ///
+    /// `0` is the released behaviour, which has **no internal iterative
+    /// reduction at all**. Every engine in the reference tree has one:
+    /// Stockfish `depth >= 6`, Ethereal `depth >= 7`, Berserk `depth >= 4`,
+    /// each reducing by a single ply on a node whose transposition move is
+    /// missing.
+    ///
+    /// Janus tracks no cut-node flag, so the reduction cannot be gated on
+    /// `PvNode || cutnode` the way the references gate it. It applies at every
+    /// node type instead, which is the shape the idea had before that
+    /// refinement.
+    pub internal_iterative_reduction: i32,
+    /// Used for the centipawn slack a lazy evaluation demands before skipping
+    /// the attack-dependent terms, or a negative value to evaluate in full.
+    ///
+    /// `-1` is the released behaviour. The margin lives here rather than in
+    /// the evaluator because it is a search-side accuracy/speed trade that has
+    /// to be swept: the searcher widens the window it hands to
+    /// `evaluate_windowed`, so `cheap - margin >= beta` becomes the
+    /// evaluator's plain `cheap >= beta`.
+    ///
+    /// Used only for the quiescence stand pat. The main search feeds its static
+    /// evaluation to `improving`, razoring, futility, probcut and the
+    /// correction-history update, and an approximation there would be learned
+    /// and carried far from the node that took the shortcut.
+    pub lazy_eval_margin: i32,
+    /// Used for scaling continuation-history pruning of quiet moves.
+    ///
+    /// `0` is the released behaviour, which has **no history-based pruning at
+    /// all**: a quiet move whose continuation history says it has failed
+    /// everywhere it has ever been tried is searched anyway, at full width,
+    /// until the move-count threshold happens to cut it off.
+    ///
+    /// Alternative configuration retained for controlled evaluation.
+    ///
+    /// The threshold is `-scale * depth` against
+    /// [`SearchContext::continuation_score`], which sums two tables each
+    /// bounded by `HISTORY_MAX`. Stockfish's threshold is about `4.2%` of its
+    /// summed range per ply of depth, which puts the equivalent scale here
+    /// near `1400`.
+    pub continuation_prune_scale: i32,
+    /// Used for halving the late-move-pruning threshold at a non-improving
+    /// node.
+    ///
+    /// `false` is the released behaviour, whose threshold is `3 + depth^2`
+    /// whether or not the static evaluation is rising. Stockfish divides the
+    /// same quadratic by `2 - improving`, so a node that is *not* improving
+    /// prunes at **half** the move count. Janus is therefore roughly twice as
+    /// lax exactly where laxity is least justified.
+    pub late_move_pruning_improving_split: bool,
+    /// Used for setting the first move index late-move reduction may touch.
+    ///
+    /// Alternative configuration retained for controlled evaluation.
+    pub late_move_reduction_min_searched: u16,
+    /// Used for demoting quiet moves that lose material to a static exchange.
+    ///
+    /// Alternative configuration retained for controlled evaluation.
+    ///
+    /// The exchange is not free, and the ordering pre-screen holds nodes fixed
+    /// and therefore cannot see its cost — a positive screen here still owes a
+    /// `bulk-nodes` throughput check before any clocked claim.
+    pub quiet_see_order_penalty: i32,
+    /// Used for allocating and consulting a four-ply continuation history.
+    ///
+    /// Alternative configuration retained for controlled evaluation.
+    pub continuation_four: bool,
+    /// Used for scaling the root aspiration half-width.
+    ///
+    /// `100` is the released 50 centipawns. Stockfish 11 opens at roughly 18
+    /// and widens exponentially on a fail, so Janus starts almost three times
+    /// wider. A wider window costs fewer re-searches but gives every root
+    /// iteration looser bounds, and looser bounds cut less — which makes this
+    /// a branching-factor knob rather than a time-management one.
+    ///
+    /// A failed window costs only a re-search and discards nothing, so unlike
+    /// the futility and late-move families this mechanism never loses a move
+    /// to a mis-scored evaluation.
+    pub aspiration_window_percent: i32,
+    /// Used for pruning quiet moves whose destination loses material.
+    ///
+    /// Alternative configuration retained for controlled evaluation.
+    ///
+    /// Alternative configuration retained for controlled evaluation.
+    pub quiet_see_prune_margin: i32,
+    /// Used for denominating the quiet prune's exchange in evaluator units.
+    ///
+    /// Alternative configuration retained for controlled evaluation.
+    pub quiet_see_evaluator_units: bool,
+    /// Used for scaling the quiet prune's margin linearly in depth rather than
+    /// quadratically.
+    ///
+    /// Alternative configuration retained for controlled evaluation.
+    pub quiet_see_linear_margin: bool,
+    /// Used for keeping a root improvement proven inside an aborted iteration.
+    ///
+    /// `false` is the released behaviour, which discards an entire iteration
+    /// the moment the node or time budget expires and plays the previous
+    /// iteration's move, even when that iteration had already searched a
+    /// different root move to a finished full-window score and found it
+    /// better. Setting this keeps exactly that one fact — see
+    /// [`accepted_partial_root`] for the rule and for why every other part of
+    /// an aborted iteration is discarded.
+    ///
+    /// This changes no search decision and no node: the records are written at
+    /// the root and read only after `negamax` has already returned `None`, so
+    /// the tree is identical either way and only the reported move can move.
+    ///
+    /// The mechanism is far rarer than the waste it targets. Traced over 40
+    /// screening games at 25,000 nodes, `77.4%` of aborted iterations expired
+    /// before even the previous best move's own root search finished, leaving
+    /// nothing proven to keep; a new root move overtook and survived every
+    /// guard in `1.16%` of them.
+    pub accept_partial_root: bool,
+    /// Used for lengthening the soft budget when the score is falling.
+    ///
+    /// Thousandths of the budget added per centipawn the completed iteration
+    /// scored below the one before it, clamped by
+    /// [`crate::search_math::FALLING_EVAL_CAP_CENTIPAWNS`]. `0` is the released
+    /// behaviour and an
+    /// exact no-op: the budget is multiplied by exactly `1000/1000`.
+    ///
+    /// Janus already scales by best-move *stability*, which measures when the
+    /// engine is confident. This is the independent, opposite signal -- when
+    /// the position just turned against it -- and a move can be perfectly
+    /// stable while the score collapses under it.
+    pub falling_eval_percent: i32,
+    /// Used for contracting the aspiration retry instead of widening it.
+    ///
+    /// `false` is the released behaviour, in which BOTH retry branches move the
+    /// bound that did *not* fail outward: a fail low raises beta, a fail high
+    /// lowers alpha. Each retry is then a strict superset of the search that
+    /// just failed, even though the failure proved the true score lies outside
+    /// the bound being widened.
+    ///
+    /// `true` contracts toward the midpoint on a fail low and leaves alpha
+    /// alone on a fail high, which is what the reference engines do.
+    ///
+    /// The retry loop exists at TWO sites, `MultiPV` and single-PV, differing in
+    /// both indentation and whether they track `previous_score` or
+    /// `best_score`. Editing one is a silent partial no-op.
+    pub aspiration_contract: bool,
+    /// Used for reducing the root re-search depth after an aspiration fail high.
+    ///
+    /// Alternative configuration retained for controlled evaluation.
+    ///
+    /// Alternative configuration retained for controlled evaluation.
+    ///
+    /// A positive value subtracts that many plies per *consecutive* fail high,
+    /// which is what the reference engines do. A fail high has already proved
+    /// the true score exceeds beta; the retry only has to find which move
+    /// carries it, and the next iteration re-verifies at full depth.
+    ///
+    /// Fail lows are never reduced, and reset the count. A fail low means the
+    /// position is worse than believed, which is when depth matters most.
+    ///
+    /// The retry loop exists at TWO sites, `MultiPV` and single-PV. Editing one
+    /// is a silent partial no-op.
+    pub root_fail_high_reduction: i32,
+    /// Used for growing the aspiration window gently instead of doubling it.
+    ///
+    /// `false` is the released behaviour: the half-width doubles on every
+    /// retry. `true` grows by a quarter plus five, which is roughly what the
+    /// reference engines do.
+    ///
+    /// Alternative configuration retained for controlled evaluation.
+    ///
+    /// [`AlphaBeta::research_aspiration_contract`] sets both flags together so
+    /// that arm still reproduces the exact configuration that measured `-1.85`.
+    pub aspiration_gentle_growth: bool,
+}
+
+impl Default for ResearchSearch {
+    /// Used for selecting released behavior in every dimension.
+    ///
+    /// # Returns
+    ///
+    /// Correction history off, the released late-move prune, and unscaled
+    /// margins.
+    fn default() -> Self {
+        Self {
+            // Historical calibration detail omitted from the public source release.
+            correction: CorrectionHistoryMode::PawnAndNonPawn,
+            eval_free_late_move_pruning: false,
+            margin_scale_percent: RELEASED_MARGIN_SCALE_PERCENT,
+            reconciled_delta_material: true,
+            reconciled_probcut_see: false,
+            correction_gain_percent: 100,
+            clear_correction_each_search: false,
+            null_move_base: RELEASED_NULL_MOVE_BASE,
+            null_move_depth_divisor: RELEASED_NULL_MOVE_DEPTH_DIVISOR,
+            reverse_futility_max_depth: REVERSE_FUTILITY_MAX_DEPTH,
+            futility_max_depth: FUTILITY_MAX_DEPTH,
+            late_move_pruning_max_depth: LATE_MOVE_PRUNING_MAX_DEPTH,
+            late_move_pruning_threshold_percent: 100,
+            counter_move_ordering: false,
+            colored_history: false,
+            history_malus: false,
+            quiet_order_prior_percent: 0,
+            quiet_order_continuation_percent: 100,
+            razor_base: 0,
+            razor_scale: 0,
+            capture_see_prune_scale: 0,
+            capture_futility_scale: 0,
+            flat_move_order: false,
+            legacy_horizon_before_stand_pat: false,
+            horizon_mate_scan: false,
+            quiescence_tt_all_plies: false,
+            internal_iterative_reduction: 0,
+            lazy_eval_margin: -1,
+            continuation_prune_scale: 0,
+            late_move_pruning_improving_split: false,
+            late_move_reduction_min_searched: RELEASED_LMR_MIN_SEARCHED,
+            quiet_see_order_penalty: 0,
+            continuation_four: false,
+            aspiration_window_percent: 100,
+            quiet_see_prune_margin: RELEASED_QUIET_SEE_PRUNE_MARGIN,
+            quiet_see_evaluator_units: false,
+            quiet_see_linear_margin: false,
+            falling_eval_percent: 0,
+            aspiration_contract: false,
+            // Historical calibration detail omitted from the public source release.
+            root_fail_high_reduction: 1,
+            aspiration_gentle_growth: false,
+            // Historical calibration detail omitted from the public source release.
+            accept_partial_root: true,
+        }
+    }
+}
+
+impl ResearchSearch {
+    /// Used for applying the research aspiration scale to the released
+    /// half-width.
+    ///
+    /// The margin scale applies first, so an aspiration sweep run on top of a
+    /// margin-scaled build still measures the aspiration change alone.
+    ///
+    /// # Arguments
+    ///
+    /// * `released` - released aspiration half-width in centipawns
+    ///
+    /// # Returns
+    ///
+    /// The scaled half-width, at least one centipawn so the window never
+    /// collapses onto the previous score.
+    const fn aspiration_window(self, released: i32) -> i32 {
+        let scaled = self.margin(released) * self.aspiration_window_percent / 100;
+        if scaled < 1 {
+            1
+        } else {
+            scaled
+        }
+    }
+
+    /// Used for applying the research margin scale to one released threshold.
+    ///
+    /// # Arguments
+    ///
+    /// * `margin` - released centipawn threshold
+    ///
+    /// # Returns
+    ///
+    /// The scaled threshold, or `margin` unchanged at the released setting.
+    /// Used for valuing a captured piece on the scale the caller compares it
+    /// against.
+    ///
+    /// Returns the search's own table at the released setting, and the
+    /// evaluator's table — including the `SEARCH_SCORE_SCALE_PERCENT`
+    /// calibration that the evaluator's own scores carry — when
+    /// [`Self::reconciled_delta_material`] is set.
+    ///
+    /// # Arguments
+    ///
+    /// * `position` - position the move is played in
+    /// * `mv` - capture whose victim is valued
+    ///
+    /// # Returns
+    ///
+    /// The victim's value, or zero when the move captures nothing.
+    fn captured_value(self, position: &Position, mv: Move) -> i32 {
+        if self.reconciled_delta_material {
+            captured_piece(position, mv).map_or(0, |piece| evaluator_material_value(piece.kind))
+        } else {
+            captured_value(position, mv)
+        }
+    }
+
+    const fn margin(self, margin: i32) -> i32 {
+        if self.margin_scale_percent == 100 {
+            margin
+        } else {
+            margin * self.margin_scale_percent / 100
+        }
+    }
 }
 
 /// One correction-history cell holding a scaled centipawn residual.
@@ -304,6 +786,32 @@ fn pawn_structure_key(position: &Position) -> u64 {
     mix_bits(white).rotate_left(1) ^ mix_bits(black)
 }
 
+/// Used for deriving the combined major-piece placement key.
+///
+/// Rooks and queens of both colours are hashed together, so the table this
+/// keys views a position through where the heavy pieces stand irrespective of
+/// pawn structure or minor placement. Colours are rotated apart so a position
+/// and its colour-swapped major skeleton do not share a cell.
+///
+/// # Arguments
+///
+/// * `position` - position whose major pieces are hashed
+///
+/// # Returns
+///
+/// A 64-bit key determined by major-piece placement alone.
+fn major_structure_key(position: &Position) -> u64 {
+    let mut key = 0;
+    for (index, color) in [Color::White, Color::Black].into_iter().enumerate() {
+        for (offset, kind) in [PieceKind::Rook, PieceKind::Queen].into_iter().enumerate() {
+            let board = position.piece_bitboard(Piece::new(color, kind));
+            let rotate = u32::try_from(index * 2 + offset).expect("four slots fit u32") * 13;
+            key ^= mix_bits(board).rotate_left(rotate);
+        }
+    }
+    key
+}
+
 /// Used for deriving one side's non-pawn placement key.
 ///
 /// Each kind is rotated by a distinct amount so that, for example, a knight on
@@ -348,12 +856,63 @@ const CONTINUATION_BAD: i32 = -(1 << 12);
 /// Used for bounding how far the fractional late-move reduction may extend a
 /// late quiet move.
 ///
-/// Only the STR-316 flavor can reach a negative reduction. Capping it at one
-/// ply keeps the deepening strictly smaller than the depth consumed by the
-/// recursion itself, so an extended late move cannot grow the tree without
-/// bound; the released flavor keeps its `0` floor.
+/// Alternative configuration retained for controlled evaluation.
 const LMR_MAX_EXTENSION_PLIES: i32 = 1;
 /// Used for gating null-move pruning at a minimum remaining depth.
+/// Used for sizing the root re-search after one or more aspiration fail highs.
+///
+/// # Arguments
+///
+/// * `depth` - the iteration's nominal depth in plies
+/// * `failed_high` - consecutive fail highs already recorded at this depth
+/// * `reduction` - plies to subtract per fail high, `0` for released behaviour
+///
+/// # Returns
+///
+/// The depth to re-search at: never below one ply, and never above `depth`.
+fn root_research_depth(depth: i32, failed_high: i32, reduction: i32) -> i32 {
+    if reduction <= 0 || failed_high <= 0 {
+        return depth;
+    }
+    depth
+        .saturating_sub(failed_high.saturating_mul(reduction))
+        .max(1)
+}
+
+/// Used for growing the aspiration window between retries.
+///
+/// Alternative configuration retained for controlled evaluation.
+///
+/// # Arguments
+///
+/// * `window` - current half-width
+/// * `gentle` - whether to grow by a quarter plus five instead of doubling
+///
+/// # Returns
+///
+/// The next half-width, saturating at [`INFINITY`].
+fn aspiration_grow(window: i32, gentle: bool) -> i32 {
+    if gentle {
+        window
+            .saturating_add(window / 4)
+            .saturating_add(5)
+            .min(INFINITY)
+    } else {
+        window.saturating_mul(2).min(INFINITY)
+    }
+}
+
+/// Used for the shallowest depth a late-move reduction may reduce *to*.
+///
+/// `0` is the released behaviour: a reduction may land on the horizon, where the
+/// probe becomes a quiescence call.
+///
+/// Alternative configuration retained for controlled evaluation.
+///
+/// Kept as a named constant rather than deleted so the knob is one edit away
+/// if a future search shape makes horizon reductions common again.
+const LATE_MOVE_REDUCTION_MIN_CHILD_DEPTH: i32 = 0;
+
 const NULL_MOVE_MIN_DEPTH: i32 = 3;
 /// Used for selecting the minimum remaining depth at which a null fail-high
 /// requires verification.
@@ -367,6 +926,18 @@ const NULL_MOVE_VERIFICATION_MIN_DEPTH: i32 = 16;
 const REVERSE_FUTILITY_MAX_DEPTH: i32 = 4;
 /// Used for scaling the per-ply centipawn margin of reverse futility
 /// pruning.
+/// Used for the released scale applied to every static-search margin.
+///
+/// Alternative configuration retained for controlled evaluation.
+///
+/// Alternative configuration retained for controlled evaluation.
+///
+/// Applied as a percent rather than baked into each constant because
+/// [`ResearchSearch::margin`] also scales the aspiration half-width, which
+/// arrives at its call sites rather than existing as one constant -- baking
+/// would therefore NOT reproduce the screened arm.
+const RELEASED_MARGIN_SCALE_PERCENT: i32 = 75;
+/// Used for the per-ply centipawn margin of reverse futility pruning.
 const REVERSE_FUTILITY_MARGIN: i32 = 120;
 /// Used for bounding the deepest node at which quiet-move futility pruning is
 /// allowed.
@@ -377,9 +948,30 @@ const FUTILITY_MARGIN: i32 = 150;
 /// Used for bounding the deepest node at which late quiet moves may be pruned
 /// outright.
 const LATE_MOVE_PRUNING_MAX_DEPTH: i32 = 5;
+/// Used for the released material-only quiet prune's margin in centipawns per
+/// `depth^2`.
+///
+/// Alternative configuration retained for controlled evaluation.
+const RELEASED_QUIET_SEE_PRUNE_MARGIN: i32 = 10;
+/// Alternative configuration retained for controlled evaluation.
+///
+/// The exchange simulation is not free, so the prune is confined to the
+/// shallow nodes where a quiet move losing a piece outright is both common and
+/// cheap to detect.
+const QUIET_SEE_PRUNE_MAX_DEPTH: i32 = 8;
 /// Used for retaining a material margin when delta-pruning quiescence
 /// captures.
 const DELTA_MARGIN: i32 = 200;
+/// Used for the first move index late-move reduction may touch.
+///
+/// The released search leaves the first three moves of every node unreduced.
+pub const RELEASED_LMR_MIN_SEARCHED: u16 = 3;
+/// Used for bounding razoring to shallow depths.
+///
+/// Stockfish razors to depth 18, but its quadratic margin makes the test
+/// unreachable well before that; a small cap keeps the quiescence call off the
+/// deep nodes where it would cost more than it saves.
+const RAZOR_MAX_DEPTH: i32 = 4;
 /// Used for gating internal iterative reduction at the minimum depth from
 /// which it may remove one ply.
 const IIR_MIN_DEPTH: i32 = 4;
@@ -796,7 +1388,6 @@ impl EvaluationCache {
         })
     }
 
-
     /// Used for retrieving the cached score only when the bucket contains the
     /// exact key.
     ///
@@ -809,7 +1400,8 @@ impl EvaluationCache {
     /// The cached score, or `None` on an empty or colliding bucket.
     fn get(&self, key: u64) -> Option<i32> {
         let index = self.index(key);
-        (self.occupied[index] && self.keys[index] == key).then_some(self.scores[index])
+        let hit = self.occupied[index] && self.keys[index] == key;
+        hit.then_some(self.scores[index])
     }
 
     /// Used for replacing the key and score in the key's direct-mapped
@@ -853,17 +1445,7 @@ impl EvaluationCache {
 /// reuse learned transposition entries. The evaluator type defaults to the
 /// dependency-free [`Classical`] evaluation.
 ///
-/// `FRACTIONAL_LMR` selects the late-move-reduction representation at compile
-/// time and defaults to the released whole-ply formula, so every ordinary
-/// construction is unchanged. Setting it selects the STR-316 candidate that
-/// accumulates the same signals in `1/1024`-ply units. `LMR_BIAS_UNITS` then
-/// shifts that accumulation by a fixed fraction of a ply and is meaningful
-/// only for the fractional flavor; it exists because the whole-ply
-/// representation could not express a sub-ply aggression step at all, which is
-/// why every previous aggression retune had to move a large move population by
-/// a full ply at once. Keeping both choices in the type rather than in fields
-/// means no flavor pays a runtime branch and several can be instantiated side
-/// by side inside one deterministic fixed-node harness process.
+/// Alternative configuration retained for controlled evaluation.
 pub struct AlphaBeta<
     E = Classical,
     const FRACTIONAL_LMR: bool = false,
@@ -874,6 +1456,20 @@ pub struct AlphaBeta<
     /// Used for storing the persistent transposition table reused between
     /// searches.
     table: TableStorage,
+    /// Used for caching static evaluator results by exact position key,
+    /// reused between searches.
+    ///
+    /// Alternative configuration retained for controlled evaluation.
+    ///
+    /// Persisting is exact rather than approximate: a position's evaluation
+    /// does not depend on when it is computed, and the correction-history
+    /// adjustment is applied to the cached raw score by the caller rather
+    /// than stored here.
+    ///
+    /// Allocated lazily on the first search, as the correction history is,
+    /// because the infallible constructors cannot report an allocation
+    /// failure.
+    eval_cache: Option<EvaluationCache>,
     /// Used for tagging table entries with a wrapping age advanced once per
     /// search.
     generation: u16,
@@ -888,6 +1484,10 @@ pub struct AlphaBeta<
     /// flavors can be instantiated side by side in one deterministic
     /// fixed-node harness process.
     research: ResearchSearch,
+    /// Used for retaining structural correction tables across searches.
+    ///
+    /// Alternative configuration retained for controlled evaluation.
+    correction_history: Vec<CorrectionEntry>,
 }
 
 impl AlphaBeta<Classical> {
@@ -915,7 +1515,7 @@ impl Default for AlphaBeta<Classical> {
 }
 
 impl<E: SearchEvaluator, const LMR_BIAS_UNITS: i32> AlphaBeta<E, true, LMR_BIAS_UNITS> {
-    /// Used for creating the STR-316 fractional late-move-reduction searcher.
+    /// Alternative configuration retained for controlled evaluation.
     ///
     /// This is the only constructor of the candidate flavor, so the ordinary
     /// engine cannot reach it by accident and the two flavors can still be
@@ -939,7 +1539,7 @@ impl<E: SearchEvaluator, const LMR_BIAS_UNITS: i32> AlphaBeta<E, true, LMR_BIAS_
 }
 
 impl<E: SearchEvaluator> AlphaBeta<E, false> {
-    /// Used for creating the `STR-20260806-331` correction-history searcher.
+    /// Alternative configuration retained for controlled evaluation.
     ///
     /// The flavor is a field rather than a type parameter because the released
     /// mode allocates no tables and takes one predictable branch per node,
@@ -969,8 +1569,788 @@ impl<E: SearchEvaluator> AlphaBeta<E, false> {
         searcher
     }
 
-    /// Used for creating the `STR-20260806-335` evaluation-independent
-    /// late-move-pruning searcher.
+    /// Alternative configuration retained for controlled evaluation.
+    ///
+    /// Alternative configuration retained for controlled evaluation.
+    ///
+    /// # Arguments
+    ///
+    /// * `evaluator` - position evaluator driving leaf scores and priors
+    /// * `entries` - number of local transposition-table entries
+    ///
+    /// # Returns
+    ///
+    /// A searcher whose delta prune speaks the evaluator's material scale.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn research_reconciled_delta_material(evaluator: E, entries: usize) -> Self {
+        let mut searcher = Self::from_local_entries(evaluator, entries);
+        searcher.research.reconciled_delta_material = true;
+        searcher
+    }
+
+    /// Alternative configuration retained for controlled evaluation.
+    ///
+    /// Measures `ProbCut`'s capture gate on the evaluator's material scale, so
+    /// the exchange and the threshold it is compared against share units.
+    ///
+    /// # Arguments
+    ///
+    /// * `evaluator` - position evaluator driving leaf scores and priors
+    /// * `entries` - number of local transposition-table entries
+    ///
+    /// # Returns
+    ///
+    /// A searcher whose `ProbCut` gate speaks the evaluator's material scale.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn research_reconciled_probcut_see(evaluator: E, entries: usize) -> Self {
+        let mut searcher = Self::from_local_entries(evaluator, entries);
+        searcher.research.reconciled_probcut_see = true;
+        searcher
+    }
+
+    /// Alternative configuration retained for controlled evaluation.
+    ///
+    /// Runs the winning correction flavour and the reconciled delta prune with
+    /// the applied correction scaled, so the untuned saturation ceiling can be
+    /// probed without disturbing either mechanism.
+    ///
+    /// # Arguments
+    ///
+    /// * `evaluator` - position evaluator driving leaf scores and priors
+    /// * `entries` - number of local transposition-table entries
+    /// * `percent` - percentage applied to the summed correction
+    ///
+    /// # Returns
+    ///
+    /// A searcher running the batch at the requested correction gain.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn research_correction_gain(evaluator: E, entries: usize, percent: i32) -> Self {
+        let mut searcher = Self::research_correction_mode_and_reconciled(
+            evaluator,
+            entries,
+            CorrectionHistoryMode::PawnAndNonPawn,
+        );
+        searcher.research.correction_gain_percent = percent;
+        searcher
+    }
+
+    /// Alternative configuration retained for controlled evaluation.
+    ///
+    /// Restores the behaviour the promoted engine had — correction tables
+    /// discarded at every root — so a screen against the release measures
+    /// persistence and nothing else.
+    ///
+    /// # Arguments
+    ///
+    /// * `evaluator` - position evaluator driving leaf scores and priors
+    /// * `entries` - number of local transposition-table entries
+    ///
+    /// # Returns
+    ///
+    /// A searcher that relearns the evaluator's bias from nothing each move.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn research_cleared_correction(evaluator: E, entries: usize) -> Self {
+        let mut searcher = Self::from_local_entries(evaluator, entries);
+        searcher.research.clear_correction_each_search = true;
+        searcher
+    }
+
+    /// Alternative configuration retained for controlled evaluation.
+    ///
+    /// Alternative configuration retained for controlled evaluation.
+    ///
+    /// # Arguments
+    ///
+    /// * `evaluator` - position evaluator driving leaf scores and priors
+    /// * `entries` - number of local transposition-table entries
+    ///
+    /// # Returns
+    ///
+    /// A searcher running both mechanisms.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn research_correction_and_reconciled(evaluator: E, entries: usize) -> Self {
+        Self::research_correction_mode_and_reconciled(
+            evaluator,
+            entries,
+            CorrectionHistoryMode::Pawn,
+        )
+    }
+
+    /// Used for composing a chosen correction flavor with the reconciled delta
+    /// prune.
+    ///
+    /// Alternative configuration retained for controlled evaluation.
+    ///
+    /// # Arguments
+    ///
+    /// * `evaluator` - position evaluator driving leaf scores and priors
+    /// * `entries` - number of local transposition-table entries
+    /// * `mode` - correction-history flavor to compose
+    ///
+    /// # Returns
+    ///
+    /// A searcher running both mechanisms.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn research_correction_mode_and_reconciled(
+        evaluator: E,
+        entries: usize,
+        mode: CorrectionHistoryMode,
+    ) -> Self {
+        let mut searcher = Self::from_local_entries(evaluator, entries);
+        searcher.research.correction = mode;
+        searcher.research.reconciled_delta_material = true;
+        searcher
+    }
+
+    /// Alternative configuration retained for controlled evaluation.
+    ///
+    /// Alternative configuration retained for controlled evaluation.
+    ///
+    /// # Arguments
+    ///
+    /// * `evaluator` - position evaluator driving leaf scores and priors
+    /// * `entries` - number of local transposition-table entries
+    /// * `percent` - percentage applied to every absolute margin
+    ///
+    /// # Returns
+    ///
+    /// A searcher whose pruning thresholds are scaled and whose evaluation is
+    /// exactly the release.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn research_margin_scale(evaluator: E, entries: usize, percent: i32) -> Self {
+        let mut searcher = Self::from_local_entries(evaluator, entries);
+        searcher.research.margin_scale_percent = percent;
+        searcher
+    }
+
+    /// Alternative configuration retained for controlled evaluation.
+    ///
+    /// The released reduction is `2 + depth / 6`, inherited unchanged from the
+    /// Java engine Janus was ported from. Stockfish 11's is roughly
+    /// `3.2 + depth / 4`, so at the depths a screened search reaches the
+    /// released term is one to two plies more timid. Branching factor is the
+    /// campaign's dominant measured deficit, and null-move reduction is the
+    /// single cheapest lever on it, so this flavour varies the base and the
+    /// growth rate together.
+    ///
+    /// # Arguments
+    ///
+    /// * `evaluator` - position evaluator driving leaf scores and priors
+    /// * `entries` - number of local transposition-table entries
+    /// * `base` - constant reduction in plies before the depth term
+    /// * `divisor` - plies of depth worth one further ply of reduction
+    ///
+    /// # Returns
+    ///
+    /// A searcher owning a freshly allocated local table and reducing null
+    /// moves at the requested rate.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn research_null_move_growth(evaluator: E, entries: usize, base: u8, divisor: u8) -> Self {
+        let mut searcher = Self::from_local_entries(evaluator, entries);
+        searcher.research.null_move_base = base;
+        searcher.research.null_move_depth_divisor = divisor;
+        searcher
+    }
+
+    /// Alternative configuration retained for controlled evaluation.
+    ///
+    /// # Arguments
+    ///
+    /// * `evaluator` - evaluator the searcher owns
+    /// * `entries` - transposition table capacity in entries
+    ///
+    /// # Returns
+    ///
+    /// A searcher whose quiescence scans for a horizon mate before its stand
+    /// pat rather than after it.
+    #[must_use]
+    pub fn research_legacy_horizon_scan(evaluator: E, entries: usize) -> Self {
+        let mut searcher = Self::from_local_entries(evaluator, entries);
+        searcher.research.legacy_horizon_before_stand_pat = true;
+        searcher
+    }
+
+    /// Used for creating a searcher whose quiescence has no horizon
+    /// mate-in-one scan, which is what every engine in the reference tree does.
+    ///
+    /// # Arguments
+    ///
+    /// * `evaluator` - evaluator the searcher owns
+    /// * `entries` - transposition table capacity in entries
+    ///
+    /// # Returns
+    ///
+    /// A searcher whose horizon nodes generate tactical moves only.
+    #[must_use]
+    pub fn research_no_horizon_mate_scan(evaluator: E, entries: usize) -> Self {
+        let mut searcher = Self::from_local_entries(evaluator, entries);
+        searcher.research.horizon_mate_scan = false;
+        searcher
+    }
+
+    /// Used for creating a searcher whose quiescence reads and writes the
+    /// transposition table at every ply, as Stockfish does.
+    ///
+    /// # Arguments
+    ///
+    /// * `evaluator` - evaluator the searcher owns
+    /// * `entries` - transposition table capacity in entries
+    ///
+    /// # Returns
+    ///
+    /// A searcher that transposes inside quiescence rather than only at its
+    /// entry nodes.
+    #[must_use]
+    pub fn research_quiescence_tt(evaluator: E, entries: usize) -> Self {
+        let mut searcher = Self::from_local_entries(evaluator, entries);
+        searcher.research.quiescence_tt_all_plies = true;
+        searcher
+    }
+
+    /// Used for creating a searcher with internal iterative reduction.
+    ///
+    /// # Arguments
+    ///
+    /// * `evaluator` - evaluator the searcher owns
+    /// * `entries` - transposition table capacity in entries
+    /// * `minimum_depth` - depth from which a node with no transposition move
+    ///   loses a ply
+    ///
+    /// # Returns
+    ///
+    /// A searcher that reduces transposition-less nodes by one ply.
+    #[must_use]
+    pub fn research_internal_iterative_reduction(
+        evaluator: E,
+        entries: usize,
+        minimum_depth: i32,
+    ) -> Self {
+        let mut searcher = Self::from_local_entries(evaluator, entries);
+        searcher.research.internal_iterative_reduction = minimum_depth;
+        searcher
+    }
+
+    /// Alternative configuration retained for controlled evaluation.
+    ///
+    /// # Arguments
+    ///
+    /// * `evaluator` - evaluator the searcher owns
+    /// * `entries` - transposition table capacity in entries
+    /// * `margin` - centipawn slack before the attack terms are skipped;
+    ///   negative evaluates in full
+    ///
+    /// # Returns
+    ///
+    /// A searcher whose quiescence stand pat may skip the rich attack terms.
+    #[must_use]
+    pub fn research_lazy_eval(evaluator: E, entries: usize, margin: i32) -> Self {
+        let mut searcher = Self::from_local_entries(evaluator, entries);
+        searcher.research.lazy_eval_margin = margin;
+        searcher
+    }
+
+    /// Alternative configuration retained for controlled evaluation.
+    ///
+    /// Alternative configuration retained for controlled evaluation.
+    ///
+    /// Unlike the null-move flavour these three share an input — all of them
+    /// prune against the same static evaluation — so they are not expected to
+    /// compose additively and are screened one at a time before any
+    /// composition is believed.
+    ///
+    /// # Arguments
+    ///
+    /// * `evaluator` - position evaluator driving leaf scores and priors
+    /// * `entries` - number of local transposition-table entries
+    /// * `reverse` - deepest node at which reverse futility may return
+    /// * `futility` - deepest node at which forward futility may skip a quiet
+    /// * `late_move` - deepest node at which late-move pruning may skip a quiet
+    /// * `threshold_percent` - scale on the searched-quiet count that gates
+    ///   late-move pruning, `100` for the released `3 + depth^2`
+    ///
+    /// # Returns
+    ///
+    /// Alternative configuration retained for controlled evaluation.
+    ///
+    /// # Arguments
+    ///
+    /// * `evaluator` - position evaluator driving leaf scores and priors
+    /// * `entries` - number of local transposition-table entries
+    /// * `margin` - centipawns per `depth^2` a quiet move may lose before it
+    ///   is skipped; `0` disables the prune
+    ///
+    /// # Returns
+    ///
+    /// Alternative configuration retained for controlled evaluation.
+    ///
+    /// # Arguments
+    ///
+    /// * `evaluator` - position evaluator driving leaf scores and priors
+    /// * `entries` - number of local transposition-table entries
+    ///
+    /// # Returns
+    ///
+    /// Alternative configuration retained for controlled evaluation.
+    ///
+    /// # Arguments
+    ///
+    /// * `evaluator` - position evaluator driving leaf scores and priors
+    /// * `entries` - number of local transposition-table entries
+    /// * `prior` - percentage weight on the evaluator's quiet prior
+    /// * `continuation` - percentage weight on continuation history
+    ///
+    /// # Returns
+    ///
+    /// A searcher ordering quiets under the requested weights.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn research_quiet_order_weights(
+        evaluator: E,
+        entries: usize,
+        prior: i32,
+        continuation: i32,
+    ) -> Self {
+        let mut searcher = Self::from_local_entries(evaluator, entries);
+        searcher.research.quiet_order_prior_percent = prior;
+        searcher.research.quiet_order_continuation_percent = continuation;
+        searcher
+    }
+
+    /// Alternative configuration retained for controlled evaluation.
+    ///
+    /// Alternative configuration retained for controlled evaluation.
+    ///
+    /// # Arguments
+    ///
+    /// * `evaluator` - position evaluator driving leaf scores and priors
+    /// * `entries` - number of local transposition-table entries
+    ///
+    /// # Returns
+    ///
+    /// A searcher consulting a four-ply continuation history.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn research_continuation_four(evaluator: E, entries: usize) -> Self {
+        let mut searcher = Self::from_local_entries(evaluator, entries);
+        searcher.research.continuation_four = true;
+        searcher
+    }
+
+    /// Alternative configuration retained for controlled evaluation.
+    ///
+    /// # Arguments
+    ///
+    /// * `evaluator` - position evaluator driving leaf scores and priors
+    /// * `entries` - number of local transposition-table entries
+    /// * `start` - first move index late-move reduction may touch
+    ///
+    /// # Returns
+    ///
+    /// A searcher beginning late-move reduction at `start`.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn research_late_move_reduction_start(evaluator: E, entries: usize, start: u16) -> Self {
+        let mut searcher = Self::from_local_entries(evaluator, entries);
+        searcher.research.late_move_reduction_min_searched = start;
+        searcher
+    }
+
+    /// Alternative configuration retained for controlled evaluation.
+    ///
+    /// # Arguments
+    ///
+    /// * `evaluator` - position evaluator driving leaf scores and priors
+    /// * `entries` - number of local transposition-table entries
+    /// * `base` - constant razoring margin in centipawns
+    /// * `scale` - coefficient of the quadratic depth margin
+    ///
+    /// # Returns
+    ///
+    /// A searcher that razors hopeless nodes into quiescence.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn research_razoring(evaluator: E, entries: usize, base: i32, scale: i32) -> Self {
+        let mut searcher = Self::from_local_entries(evaluator, entries);
+        searcher.research.razor_base = base;
+        searcher.research.razor_scale = scale;
+        searcher
+    }
+
+    /// Alternative configuration retained for controlled evaluation.
+    ///
+    /// # Arguments
+    ///
+    /// * `evaluator` - position evaluator driving leaf scores and priors
+    /// * `entries` - number of local transposition-table entries
+    /// * `see_scale` - depth-proportional exchange margin, zero to skip
+    /// * `futility_scale` - depth-proportional futility margin, zero to skip
+    ///
+    /// # Returns
+    ///
+    /// A searcher pruning captures at every depth.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn research_capture_pruning(
+        evaluator: E,
+        entries: usize,
+        see_scale: i32,
+        futility_scale: i32,
+    ) -> Self {
+        let mut searcher = Self::from_local_entries(evaluator, entries);
+        searcher.research.capture_see_prune_scale = see_scale;
+        searcher.research.capture_futility_scale = futility_scale;
+        searcher
+    }
+
+    /// Alternative configuration retained for controlled evaluation.
+    ///
+    /// # Arguments
+    ///
+    /// * `evaluator` - position evaluator driving leaf scores and priors
+    /// * `entries` - number of local transposition-table entries
+    /// * `reverse` - reverse-futility depth cap
+    /// * `futility` - forward-futility depth cap
+    /// * `margin_percent` - scale applied to both futility margins
+    ///
+    /// # Returns
+    ///
+    /// A searcher pruning statically to the requested depths and margins.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn research_deep_pruning(
+        evaluator: E,
+        entries: usize,
+        reverse: i32,
+        futility: i32,
+        margin_percent: i32,
+    ) -> Self {
+        let mut searcher = Self::from_local_entries(evaluator, entries);
+        searcher.research.reverse_futility_max_depth = reverse;
+        searcher.research.futility_max_depth = futility;
+        searcher.research.margin_scale_percent = margin_percent;
+        searcher
+    }
+
+    /// Alternative configuration retained for controlled evaluation.
+    ///
+    /// # Arguments
+    ///
+    /// * `evaluator` - position evaluator driving leaf scores and priors
+    /// * `entries` - number of local transposition-table entries
+    ///
+    /// # Returns
+    ///
+    /// A searcher that scores every non-transposition move as zero.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn research_flat_move_order(evaluator: E, entries: usize) -> Self {
+        let mut searcher = Self::from_local_entries(evaluator, entries);
+        searcher.research.flat_move_order = true;
+        searcher
+    }
+
+    /// Alternative configuration retained for controlled evaluation.
+    ///
+    /// # Arguments
+    ///
+    /// * `evaluator` - position evaluator driving leaf scores and priors
+    /// * `entries` - number of local transposition-table entries
+    /// * `continuation_scale` - continuation-history prune scale, zero to skip
+    /// * `improving_split` - whether to halve the late-move-pruning threshold
+    ///   at a non-improving node
+    ///
+    /// # Returns
+    ///
+    /// A searcher with the requested selective-search mechanisms enabled.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn research_selective_search(
+        evaluator: E,
+        entries: usize,
+        continuation_scale: i32,
+        improving_split: bool,
+    ) -> Self {
+        let mut searcher = Self::from_local_entries(evaluator, entries);
+        searcher.research.continuation_prune_scale = continuation_scale;
+        searcher.research.late_move_pruning_improving_split = improving_split;
+        searcher
+    }
+
+    /// Alternative configuration retained for controlled evaluation.
+    ///
+    /// # Arguments
+    ///
+    /// * `evaluator` - position evaluator driving leaf scores and priors
+    /// * `entries` - number of local transposition-table entries
+    /// * `penalty` - history units subtracted from a material-losing quiet
+    ///
+    /// # Returns
+    ///
+    /// A searcher demoting quiets that lose a static exchange.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn research_quiet_see_ordering(evaluator: E, entries: usize, penalty: i32) -> Self {
+        let mut searcher = Self::from_local_entries(evaluator, entries);
+        searcher.research.quiet_see_order_penalty = penalty;
+        searcher
+    }
+
+    /// Alternative configuration retained for controlled evaluation.
+    ///
+    /// # Arguments
+    ///
+    /// * `evaluator` - position evaluator driving leaf scores and priors
+    /// * `entries` - number of local transposition-table entries
+    ///
+    /// # Returns
+    ///
+    /// A searcher that penalises quiet moves tried before the cutoff in
+    /// butterfly history.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn research_history_malus(evaluator: E, entries: usize) -> Self {
+        let mut searcher = Self::from_local_entries(evaluator, entries);
+        searcher.research.history_malus = true;
+        searcher
+    }
+
+    /// Alternative configuration retained for controlled evaluation.
+    ///
+    /// # Arguments
+    ///
+    /// * `evaluator` - position evaluator driving leaf scores and priors
+    /// * `entries` - number of local transposition-table entries
+    ///
+    /// # Returns
+    ///
+    /// A searcher whose quiet history is indexed by mover colour as well as
+    /// source and destination.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn research_colored_history(evaluator: E, entries: usize) -> Self {
+        let mut searcher = Self::from_local_entries(evaluator, entries);
+        searcher.research.colored_history = true;
+        searcher
+    }
+
+    #[doc(hidden)]
+    #[must_use]
+    pub fn research_counter_move_ordering(evaluator: E, entries: usize) -> Self {
+        let mut searcher = Self::from_local_entries(evaluator, entries);
+        searcher.research.counter_move_ordering = true;
+        searcher
+    }
+
+    #[doc(hidden)]
+    #[must_use]
+    pub fn research_quiet_see_prune(evaluator: E, entries: usize, margin: i32) -> Self {
+        let mut searcher = Self::from_local_entries(evaluator, entries);
+        searcher.research.quiet_see_prune_margin = margin;
+        searcher
+    }
+
+    /// Alternative configuration retained for controlled evaluation.
+    ///
+    /// # Arguments
+    ///
+    /// * `evaluator` - position evaluator driving leaf scores and priors
+    /// * `entries` - number of local transposition-table entries
+    ///
+    /// # Returns
+    ///
+    /// A searcher owning a freshly allocated local table whose quiet prune
+    /// judges exchanges on the evaluator's fitted material ratios.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn research_quiet_see_evaluator_units(evaluator: E, entries: usize) -> Self {
+        let mut searcher = Self::from_local_entries(evaluator, entries);
+        searcher.research.quiet_see_evaluator_units = true;
+        searcher
+    }
+
+    /// Alternative configuration retained for controlled evaluation.
+    ///
+    /// # Arguments
+    ///
+    /// * `evaluator` - position evaluator driving leaf scores and priors
+    /// * `entries` - number of local transposition-table entries
+    /// * `margin` - centipawns per ply of depth a quiet move may lose
+    ///
+    /// # Returns
+    ///
+    /// A searcher whose quiet prune scales its allowance linearly in depth.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn research_quiet_see_linear(evaluator: E, entries: usize, margin: i32) -> Self {
+        let mut searcher = Self::from_local_entries(evaluator, entries);
+        searcher.research.quiet_see_prune_margin = margin;
+        searcher.research.quiet_see_linear_margin = true;
+        searcher
+    }
+
+    /// Alternative configuration retained for controlled evaluation.
+    ///
+    /// # Arguments
+    ///
+    /// * `evaluator` - position evaluator driving leaf scores
+    /// * `entries` - number of local transposition-table entries
+    /// * `contract` - whether the retry contracts the non-failing bound
+    ///
+    /// # Returns
+    ///
+    /// A searcher whose aspiration retry contracts rather than widens.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn research_aspiration_contract(evaluator: E, entries: usize, contract: bool) -> Self {
+        let mut searcher = Self::with_tt_entries(evaluator, entries);
+        searcher.research.aspiration_contract = contract;
+        // Historical calibration detail omitted from the public source release.
+        searcher.research.aspiration_gentle_growth = contract;
+        searcher
+    }
+
+    /// Alternative configuration retained for controlled evaluation.
+    ///
+    /// # Arguments
+    ///
+    /// * `evaluator` - position evaluator driving leaf scores
+    /// * `entries` - number of local transposition-table entries
+    /// * `gentle` - whether the retry grows by a quarter plus five instead of
+    ///   doubling; `false` is the released behaviour
+    ///
+    /// # Returns
+    ///
+    /// A searcher whose aspiration window grows gently, with the non-failing
+    /// bound still widened exactly as the released path does.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn research_aspiration_gentle_growth(evaluator: E, entries: usize, gentle: bool) -> Self {
+        let mut searcher = Self::with_tt_entries(evaluator, entries);
+        searcher.research.aspiration_gentle_growth = gentle;
+        searcher
+    }
+
+    /// Alternative configuration retained for controlled evaluation.
+    ///
+    /// # Arguments
+    ///
+    /// * `evaluator` - position evaluator driving leaf scores
+    /// * `entries` - number of local transposition-table entries
+    /// * `reduction` - plies subtracted per consecutive root fail high, `0` for
+    ///   released behaviour
+    ///
+    /// # Returns
+    ///
+    /// A searcher whose root re-search shortens after a fail high.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn research_root_fail_high_reduction(evaluator: E, entries: usize, reduction: i32) -> Self {
+        let mut searcher = Self::with_tt_entries(evaluator, entries);
+        searcher.research.root_fail_high_reduction = reduction;
+        searcher
+    }
+
+    /// Used for setting the falling-eval time extension on a live searcher.
+    ///
+    /// Janus scales its soft budget by best-move *stability*, which measures
+    /// when the engine is confident. This is the independent, opposite signal:
+    /// the score falling, which is when the engine is in trouble. A move can be
+    /// perfectly stable while the evaluation collapses under it.
+    ///
+    /// Alternative configuration retained for controlled evaluation.
+    ///
+    /// # Arguments
+    ///
+    /// * `percent` - thousandths of the budget added per centipawn the
+    ///   completed iteration scored below the previous one, clamped at 200cp
+    ///   inside the search; `0` is the released no-op
+    pub fn set_falling_eval_percent(&mut self, percent: i32) {
+        self.research.falling_eval_percent = percent;
+    }
+
+    /// Used for setting the root fail-high reduction on a live searcher.
+    ///
+    /// Alternative configuration retained for controlled evaluation.
+    ///
+    /// # Arguments
+    ///
+    /// * `reduction` - plies subtracted per consecutive root fail high; `0`
+    ///   restores the pre-promotion behaviour and is the A/B control
+    pub fn set_root_fail_high_reduction(&mut self, reduction: i32) {
+        self.research.root_fail_high_reduction = reduction;
+    }
+
+    /// Alternative configuration retained for controlled evaluation.
+    ///
+    /// Passing `false` is the identity control: it selects the released
+    /// behaviour through the research constructor, so a control arm measures
+    /// the wiring rather than the mechanism.
+    ///
+    /// # Arguments
+    ///
+    /// * `evaluator` - position evaluator driving leaf scores and priors
+    /// * `entries` - number of local transposition-table entries
+    /// * `accept` - whether an aborted iteration's proven root move is kept
+    ///
+    /// # Returns
+    ///
+    /// A searcher owning a freshly allocated local table that keeps, or
+    /// discards, the root verdict proven inside an aborted iteration.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn research_accept_partial_root(evaluator: E, entries: usize, accept: bool) -> Self {
+        let mut searcher = Self::from_local_entries(evaluator, entries);
+        searcher.research.accept_partial_root = accept;
+        searcher
+    }
+
+    /// Alternative configuration retained for controlled evaluation.
+    ///
+    /// # Arguments
+    ///
+    /// * `evaluator` - position evaluator driving leaf scores and priors
+    /// * `entries` - number of local transposition-table entries
+    /// * `percent` - scale on the released 50-centipawn half-width
+    ///
+    /// # Returns
+    ///
+    /// A searcher owning a freshly allocated local table and opening each root
+    /// iteration at the requested width.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn research_aspiration_window(evaluator: E, entries: usize, percent: i32) -> Self {
+        let mut searcher = Self::from_local_entries(evaluator, entries);
+        searcher.research.aspiration_window_percent = percent;
+        searcher
+    }
+
+    #[doc(hidden)]
+    #[must_use]
+    pub fn research_pruning_caps(
+        evaluator: E,
+        entries: usize,
+        reverse: i32,
+        futility: i32,
+        late_move: i32,
+        threshold_percent: i32,
+    ) -> Self {
+        let mut searcher = Self::from_local_entries(evaluator, entries);
+        searcher.research.reverse_futility_max_depth = reverse;
+        searcher.research.futility_max_depth = futility;
+        searcher.research.late_move_pruning_max_depth = late_move;
+        searcher.research.late_move_pruning_threshold_percent = threshold_percent;
+        searcher
+    }
+
+    /// Alternative configuration retained for controlled evaluation.
     ///
     /// Janus's released late-move prune fires only when the static evaluation
     /// is already far below alpha, which makes an eval-independent mechanism
@@ -1049,6 +2429,8 @@ impl<E: SearchEvaluator> AlphaBeta<E, false> {
             generation: 0,
             syzygy: None,
             research: ResearchSearch::default(),
+            correction_history: Vec::new(),
+            eval_cache: None,
         }
     }
 
@@ -1075,6 +2457,8 @@ impl<E: SearchEvaluator> AlphaBeta<E, false> {
             generation: 0,
             syzygy: None,
             research: ResearchSearch::default(),
+            correction_history: Vec::new(),
+            eval_cache: None,
         }
     }
 }
@@ -1103,7 +2487,119 @@ impl<E: SearchEvaluator, const FRACTIONAL_LMR: bool, const LMR_BIAS_UNITS: i32>
             generation: 0,
             syzygy: None,
             research: ResearchSearch::default(),
+            correction_history: Vec::new(),
+            eval_cache: None,
         }
+    }
+
+    /// Used for restoring per-root correction clearing on an already
+    /// constructed searcher.
+    ///
+    /// Alternative configuration retained for controlled evaluation.
+    #[doc(hidden)]
+    pub fn enable_research_cleared_correction(&mut self) {
+        self.research.clear_correction_each_search = true;
+    }
+
+    /// Used for restoring the superseded evaluator quiet ordering prior on an
+    /// already constructed searcher.
+    ///
+    /// Alternative configuration retained for controlled evaluation.
+    #[doc(hidden)]
+    pub fn enable_research_legacy_quiet_prior(&mut self) {
+        self.research.quiet_order_prior_percent = 100;
+    }
+
+    /// Alternative configuration retained for controlled evaluation.
+    ///
+    /// The clocked lane pairs two immutable binaries rather than toggling a
+    /// UCI option, so the candidate has to be switchable at build time.
+    #[doc(hidden)]
+    pub fn enable_research_counter_move_ordering(&mut self) {
+        self.research.counter_move_ordering = true;
+    }
+
+    /// Alternative configuration retained for controlled evaluation.
+    ///
+    /// The clocked lane pairs two immutable binaries rather than toggling a
+    /// UCI option, so the *baseline* has to be switchable at build time.
+    #[doc(hidden)]
+    pub fn disable_research_quiet_see_prune(&mut self) {
+        self.research.quiet_see_prune_margin = 0;
+    }
+
+    /// Alternative configuration retained for controlled evaluation.
+    ///
+    /// Alternative configuration retained for controlled evaluation.
+    #[doc(hidden)]
+    pub fn enable_research_legacy_corrhist(&mut self) {
+        self.research.correction = CorrectionHistoryMode::Off;
+        self.research.reconciled_delta_material = false;
+    }
+
+    /// Alternative configuration retained for controlled evaluation.
+    ///
+    /// Alternative configuration retained for controlled evaluation.
+    #[doc(hidden)]
+    pub fn enable_research_legacy_null_move(&mut self) {
+        self.research.null_move_base = 2;
+        self.research.null_move_depth_divisor = 6;
+    }
+
+    /// Alternative configuration retained for controlled evaluation.
+    #[doc(hidden)]
+    pub fn enable_research_corrhist_reconciled(&mut self) {
+        // Historical calibration detail omitted from the public source release.
+        self.research.correction = CorrectionHistoryMode::PawnAndNonPawn;
+        self.research.reconciled_delta_material = true;
+    }
+
+    /// Used for sizing the persistent correction tables to the active flavour.
+    ///
+    /// Alternative configuration retained for controlled evaluation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError::ResourceExhausted`] when the workspace cannot be
+    /// admitted.
+    /// Used for allocating or resizing the persistent evaluation cache.
+    ///
+    /// The cache survives between searches, so it is only rebuilt when the
+    /// configured size changes. Its contents stay valid across moves because
+    /// a position's evaluation does not depend on when it was computed.
+    ///
+    /// # Returns
+    ///
+    /// Success once the cache matches the configured size.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError::ResourceExhausted`] when the allocation fails.
+    fn ensure_eval_cache(&mut self) -> Result<(), SearchError> {
+        let wanted = EVAL_CACHE_SIZE.load(std::sync::atomic::Ordering::Relaxed);
+        if self.eval_cache.as_ref().map(|cache| cache.keys.len()) != Some(wanted) {
+            self.eval_cache = Some(EvaluationCache::try_new(wanted)?);
+        }
+        Ok(())
+    }
+
+    /// Used for discarding the persistent evaluation cache.
+    ///
+    /// A new game shares no positions with the previous one, so its entries
+    /// are dead weight rather than a correctness problem — evaluations remain
+    /// valid for whatever position they were computed from.
+    pub fn clear_eval_cache(&mut self) {
+        self.eval_cache = None;
+    }
+
+    fn ensure_correction_history(&mut self) -> Result<(), SearchError> {
+        let wanted = 2 * self.research.correction.table_count() * CORRECTION_ENTRIES;
+        if self.correction_history.len() != wanted {
+            self.correction_history = try_filled_vec(wanted, CorrectionEntry::default())?;
+        } else if self.research.clear_correction_each_search {
+            self.correction_history.fill(CorrectionEntry::default());
+        }
+        Ok(())
     }
 
     /// Used for installing or removing the optional Syzygy tablebases.
@@ -1175,6 +2671,12 @@ impl<E: SearchEvaluator, const FRACTIONAL_LMR: bool, const LMR_BIAS_UNITS: i32>
     pub fn clear(&mut self) {
         self.table.clear();
         self.generation = 0;
+        // Correction history survives between moves by design, but a cleared
+        // searcher is starting a new game: residuals learned about the previous
+        // one are not evidence about this one.
+        self.correction_history.fill(CorrectionEntry::default());
+        // Historical calibration detail omitted from the public source release.
+        self.clear_eval_cache();
     }
 
     /// Used for selecting the table generation of a newly started search.
@@ -1841,6 +3343,10 @@ impl<E: SearchEvaluator, const FRACTIONAL_LMR: bool, const LMR_BIAS_UNITS: i32>
         let mut previous_scores = vec![0_i32; line_count];
         let mut completed_depth = 0_u8;
         let mut stable_iterations = 0_u8;
+        // How far the last completed iteration scored BELOW the one before it.
+        // Zero while the score holds or improves, and zero for the first
+        // iteration, which has nothing to compare against.
+        let mut score_drop = 0_i32;
         let max_depth = limits.depth;
         self.evaluator
             .begin_search(position, MAX_SEARCH_PLY)
@@ -1852,6 +3358,8 @@ impl<E: SearchEvaluator, const FRACTIONAL_LMR: bool, const LMR_BIAS_UNITS: i32>
             prober.reset_hits();
             tb_cardinality = prober.cardinality();
         }
+        self.ensure_correction_history()?;
+        self.ensure_eval_cache()?;
         let mut context = SearchContext::<E, FRACTIONAL_LMR, LMR_BIAS_UNITS>::try_new(
             &mut self.evaluator,
             &mut self.table,
@@ -1863,11 +3371,15 @@ impl<E: SearchEvaluator, const FRACTIONAL_LMR: bool, const LMR_BIAS_UNITS: i32>
             self.syzygy.as_mut(),
             tb_cardinality,
             self.research,
+            &mut self.correction_history,
+            self.eval_cache
+                .as_mut()
+                .expect("ensure_eval_cache installed the cache"),
         )?;
         context.single_reply_root = single_reply_root;
 
         'iterations: for depth in 1..=max_depth {
-            if context.should_stop_before_iteration(stable_iterations) {
+            if context.should_stop_before_iteration(stable_iterations, score_drop) {
                 break;
             }
             if worker_index > 0 && helper_skips_iteration(worker_index, depth) {
@@ -1878,8 +3390,9 @@ impl<E: SearchEvaluator, const FRACTIONAL_LMR: bool, const LMR_BIAS_UNITS: i32>
             let mut iteration_lines = Vec::with_capacity(line_count);
             for (rank, previous_score) in previous_scores.iter().copied().enumerate() {
                 context.root_moves = Some(remaining.clone().into_boxed_slice());
+                context.root_previous_best = completed_lines.get(rank).map(|line| line.0);
                 let fallback = remaining[0];
-                let mut window = ASPIRATION_WINDOW;
+                let mut window = self.research.aspiration_window(ASPIRATION_WINDOW);
                 let (mut alpha, mut beta) =
                     if depth >= ASPIRATION_START_DEPTH && completed_depth > 0 {
                         (
@@ -1890,12 +3403,17 @@ impl<E: SearchEvaluator, const FRACTIONAL_LMR: bool, const LMR_BIAS_UNITS: i32>
                         (-INFINITY, INFINITY)
                     };
 
+                let mut failed_high = 0i32;
                 let completed = loop {
                     context.clear_root_pv();
                     let mut working = position.clone();
                     let Some(score) = context.negamax(
                         &mut working,
-                        i32::from(depth),
+                        root_research_depth(
+                            i32::from(depth),
+                            failed_high,
+                            self.research.root_fail_high_reduction,
+                        ),
                         alpha,
                         beta,
                         0,
@@ -1906,14 +3424,32 @@ impl<E: SearchEvaluator, const FRACTIONAL_LMR: bool, const LMR_BIAS_UNITS: i32>
                     };
 
                     if score <= alpha && alpha > -INFINITY {
-                        window = window.saturating_mul(2).min(INFINITY);
+                        failed_high = 0;
+                        // Halved rather than summed so a window already at
+                        // +-INFINITY cannot overflow reaching its midpoint.
+                        let midpoint = alpha / 2 + beta / 2;
+                        window = aspiration_grow(window, self.research.aspiration_gentle_growth);
                         alpha = score.saturating_sub(window).max(-INFINITY);
-                        beta = previous_score.saturating_add(window).min(INFINITY);
+                        // A fail low PROVED the score lies below alpha, so raising
+                        // beta widens the retry into a region already excluded --
+                        // making it a strict superset of the search that just
+                        // failed. Contracting toward the midpoint keeps the retry
+                        // cheap and still brackets the true score.
+                        beta = if self.research.aspiration_contract {
+                            midpoint.max(alpha.saturating_add(1))
+                        } else {
+                            previous_score.saturating_add(window).min(INFINITY)
+                        };
                         continue;
                     }
                     if score >= beta && beta < INFINITY {
-                        window = window.saturating_mul(2).min(INFINITY);
-                        alpha = previous_score.saturating_sub(window).max(-INFINITY);
+                        failed_high = failed_high.saturating_add(1);
+                        window = aspiration_grow(window, self.research.aspiration_gentle_growth);
+                        // Mirror image: a fail high proved the score lies above
+                        // beta, so lowering alpha explores an excluded region.
+                        if !self.research.aspiration_contract {
+                            alpha = previous_score.saturating_sub(window).max(-INFINITY);
+                        }
                         beta = score.saturating_add(window).min(INFINITY);
                         continue;
                     }
@@ -1923,6 +3459,31 @@ impl<E: SearchEvaluator, const FRACTIONAL_LMR: bool, const LMR_BIAS_UNITS: i32>
                 };
 
                 let Some((iteration_move, score, pv)) = completed else {
+                    // Only the first rank can carry a partial improvement: a
+                    // lower rank searches a root list with the better lines
+                    // already removed, so its verdict is not a claim about the
+                    // best move.
+                    if context.research.accept_partial_root && rank == 0 {
+                        if let Some((accepted, accepted_score)) = accepted_partial_root(
+                            context.partial_root_improvement(),
+                            context.root_previous_best_score(),
+                            completed_depth,
+                            completed_lines[0].0,
+                        ) {
+                            let accepted_pv = partial_root_pv(context.root_pv(), accepted);
+                            // The promoted move may already hold a lower rank;
+                            // swapping keeps every reported line distinct.
+                            if let Some(index) = completed_lines
+                                .iter()
+                                .position(|(mv, _, _)| *mv == accepted)
+                            {
+                                completed_lines.swap(0, index);
+                                previous_scores.swap(0, index);
+                            }
+                            completed_lines[0] = (accepted, accepted_score, accepted_pv);
+                            previous_scores[0] = accepted_score;
+                        }
+                    }
                     break 'iterations;
                 };
                 debug_assert!(remaining.contains(&iteration_move));
@@ -1934,6 +3495,13 @@ impl<E: SearchEvaluator, const FRACTIONAL_LMR: bool, const LMR_BIAS_UNITS: i32>
             let previous_best = completed_lines[0].0;
             stable_iterations = if iteration_lines[0].0 == previous_best {
                 stable_iterations.saturating_add(1)
+            } else {
+                0
+            };
+            // Stability and the score trend are independent signals: the best
+            // move can repeat while the score under it collapses.
+            score_drop = if completed_depth > 0 {
+                (completed_lines[0].1 - iteration_lines[0].1).max(0)
             } else {
                 0
             };
@@ -2084,10 +3652,16 @@ impl<E: SearchEvaluator, const FRACTIONAL_LMR: bool, const LMR_BIAS_UNITS: i32>
         let mut completed_depth = 0;
         let mut completed_pv = vec![fallback];
         let mut stable_iterations = 0_u8;
+        // How far the last completed iteration scored BELOW the one before it.
+        // Zero while the score holds or improves, and zero for the first
+        // iteration, which has nothing to compare against.
+        let mut score_drop = 0_i32;
         let max_depth = limits.depth;
         self.evaluator
             .begin_search(position, MAX_SEARCH_PLY)
             .map_err(|_| SearchError::ResourceExhausted)?;
+        self.ensure_correction_history()?;
+        self.ensure_eval_cache()?;
         let mut context = SearchContext::<E, FRACTIONAL_LMR, LMR_BIAS_UNITS>::try_new(
             &mut self.evaluator,
             &mut self.table,
@@ -2099,6 +3673,10 @@ impl<E: SearchEvaluator, const FRACTIONAL_LMR: bool, const LMR_BIAS_UNITS: i32>
             self.syzygy.as_mut(),
             tb_cardinality,
             self.research,
+            &mut self.correction_history,
+            self.eval_cache
+                .as_mut()
+                .expect("ensure_eval_cache installed the cache"),
         )?;
         context.single_reply_root = single_reply_root;
         if requested_root_moves.is_some() || tb_filtered {
@@ -2106,14 +3684,14 @@ impl<E: SearchEvaluator, const FRACTIONAL_LMR: bool, const LMR_BIAS_UNITS: i32>
         }
 
         'iterations: for depth in 1..=max_depth {
-            if context.should_stop_before_iteration(stable_iterations) {
+            if context.should_stop_before_iteration(stable_iterations, score_drop) {
                 break;
             }
             if worker_index > 0 && helper_skips_iteration(worker_index, depth) {
                 continue;
             }
 
-            let mut window = ASPIRATION_WINDOW;
+            let mut window = self.research.aspiration_window(ASPIRATION_WINDOW);
             let (mut alpha, mut beta) = if depth >= ASPIRATION_START_DEPTH && completed_depth > 0 {
                 (
                     best_score.saturating_sub(window).max(-INFINITY),
@@ -2122,25 +3700,55 @@ impl<E: SearchEvaluator, const FRACTIONAL_LMR: bool, const LMR_BIAS_UNITS: i32>
             } else {
                 (-INFINITY, INFINITY)
             };
+            context.root_previous_best = Some(best_move);
 
+            let mut failed_high = 0i32;
             let completed = loop {
                 context.clear_root_pv();
                 let mut working = position.clone();
-                let Some(score) =
-                    context.negamax(&mut working, i32::from(depth), alpha, beta, 0, true, false)
-                else {
+                let Some(score) = context.negamax(
+                    &mut working,
+                    root_research_depth(
+                        i32::from(depth),
+                        failed_high,
+                        self.research.root_fail_high_reduction,
+                    ),
+                    alpha,
+                    beta,
+                    0,
+                    true,
+                    false,
+                ) else {
                     break None;
                 };
 
                 if score <= alpha && alpha > -INFINITY {
-                    window = window.saturating_mul(2).min(INFINITY);
+                    failed_high = 0;
+                    // Halved rather than summed so a window already at
+                    // +-INFINITY cannot overflow reaching its midpoint.
+                    let midpoint = alpha / 2 + beta / 2;
+                    window = aspiration_grow(window, self.research.aspiration_gentle_growth);
                     alpha = score.saturating_sub(window).max(-INFINITY);
-                    beta = best_score.saturating_add(window).min(INFINITY);
+                    // A fail low PROVED the score lies below alpha, so raising
+                    // beta widens the retry into a region already excluded --
+                    // making it a strict superset of the search that just
+                    // failed. Contracting toward the midpoint keeps the retry
+                    // cheap and still brackets the true score.
+                    beta = if self.research.aspiration_contract {
+                        midpoint.max(alpha.saturating_add(1))
+                    } else {
+                        best_score.saturating_add(window).min(INFINITY)
+                    };
                     continue;
                 }
                 if score >= beta && beta < INFINITY {
-                    window = window.saturating_mul(2).min(INFINITY);
-                    alpha = best_score.saturating_sub(window).max(-INFINITY);
+                    failed_high = failed_high.saturating_add(1);
+                    window = aspiration_grow(window, self.research.aspiration_gentle_growth);
+                    // Mirror image: a fail high proved the score lies above
+                    // beta, so lowering alpha explores an excluded region.
+                    if !self.research.aspiration_contract {
+                        alpha = best_score.saturating_sub(window).max(-INFINITY);
+                    }
                     beta = score.saturating_add(window).min(INFINITY);
                     continue;
                 }
@@ -2150,10 +3758,27 @@ impl<E: SearchEvaluator, const FRACTIONAL_LMR: bool, const LMR_BIAS_UNITS: i32>
             };
 
             let Some((score, iteration_move, pv)) = completed else {
+                if context.research.accept_partial_root {
+                    if let Some((accepted, accepted_score)) = accepted_partial_root(
+                        context.partial_root_improvement(),
+                        context.root_previous_best_score(),
+                        completed_depth,
+                        best_move,
+                    ) {
+                        completed_pv = partial_root_pv(context.root_pv(), accepted);
+                        best_move = accepted;
+                        best_score = accepted_score;
+                    }
+                }
                 break 'iterations;
             };
             stable_iterations = if iteration_move == best_move {
                 stable_iterations.saturating_add(1)
+            } else {
+                0
+            };
+            score_drop = if completed_depth > 0 {
+                (best_score - score).max(0)
             } else {
                 0
             };
@@ -2185,6 +3810,81 @@ impl<E: SearchEvaluator, const FRACTIONAL_LMR: bool, const LMR_BIAS_UNITS: i32>
             tb_hits: context.tb_hits(),
             principal_variation: completed_pv,
         })
+    }
+}
+
+/// Used for deciding whether an aborted iteration's proven root move replaces
+/// the previous iteration's verdict.
+///
+/// Shared by both iterative-deepening drivers so the rule cannot drift between
+/// the single-line and `MultiPV` paths. Every rejection here is deliberate:
+///
+/// * without a completed iteration there is no verdict to improve on, and the
+///   reported depth would claim a search that never finished;
+/// * re-confirming the *same* move changes nothing that is played, so the
+///   flavour leaves the reported score alone rather than half-updating an
+///   iteration that did not finish;
+/// * the comparison is against what the previous iteration's move scored *in
+///   the aborted iteration*, not against what it scored in the completed one
+///   and not against root alpha. Alpha opens a window below the previous
+///   score, so raising it proves nothing on its own; and the previous
+///   iteration's score belongs to a shallower search, so a deeper move that
+///   scores below it may still be the better move at this depth. Only the two
+///   scores from the same depth are comparable. When the budget expired before
+///   the previous best move's own root search finished there is no baseline at
+///   all, and nothing is accepted;
+/// * a mate or mated claim is rolled back, because the partial iteration
+///   examined only a prefix of the root move list and the reported distance is
+///   not defensible without the rest of it.
+///
+/// # Arguments
+///
+/// * `partial` - root move and score recorded by the aborted iteration
+/// * `previous_best_score` - what the previous iteration's move scored in the
+///   aborted iteration
+/// * `completed_depth` - depth of the last iteration that finished
+/// * `best_move` - move the last finished iteration selected
+///
+/// # Returns
+///
+/// The accepted root move and score, or `None` to keep the previous verdict.
+fn accepted_partial_root(
+    partial: Option<(Move, i32)>,
+    previous_best_score: Option<i32>,
+    completed_depth: u8,
+    best_move: Move,
+) -> Option<(Move, i32)> {
+    let (mv, score) = partial?;
+    if completed_depth == 0 || mv == best_move || score <= previous_best_score? {
+        return None;
+    }
+    if score.abs() >= MATE_THRESHOLD {
+        return None;
+    }
+    Some((mv, score))
+}
+
+/// Used for recovering the principal variation behind an accepted partial root
+/// move.
+///
+/// The root PV slot still holds the line written by the last root alpha raise,
+/// which is the accepted move by construction. The head is re-checked anyway
+/// so that a future change to the PV bookkeeping degrades into a one-move
+/// variation instead of reporting a line that disagrees with the played move.
+///
+/// # Arguments
+///
+/// * `root_pv` - principal variation left in the root slot by the abort
+/// * `accepted` - root move the driver decided to keep
+///
+/// # Returns
+///
+/// The root principal variation, or the bare accepted move.
+fn partial_root_pv(root_pv: Vec<Move>, accepted: Move) -> Vec<Move> {
+    if root_pv.first() == Some(&accepted) {
+        root_pv
+    } else {
+        vec![accepted]
     }
 }
 
@@ -2294,9 +3994,9 @@ struct SearchContext<'a, E, const FRACTIONAL_LMR: bool = false, const LMR_BIAS_U
     /// Used for gating interior probes by piece count after root
     /// adjustment; zero disables interior probing entirely.
     tb_cardinality: usize,
-    /// Used for caching static evaluator results by exact key within one
-    /// search.
-    eval_cache: EvaluationCache,
+    /// Used for caching static evaluator results by exact key; borrowed from
+    /// the reusable searcher so it survives between moves.
+    eval_cache: &'a mut EvaluationCache,
     /// Used for recording whether evaluator lifecycle hooks are active for
     /// this root.
     incremental_evaluator: bool,
@@ -2310,6 +4010,23 @@ struct SearchContext<'a, E, const FRACTIONAL_LMR: bool = false, const LMR_BIAS_U
     continuation_one: Vec<i16>,
     /// Used for storing the two-ply piece-square continuation-history table.
     continuation_two: Vec<i16>,
+    /// Used for reusing per-ply move and cutoff-bookkeeping buffers.
+    ///
+    /// The search previously allocated three vectors at every node — the legal
+    /// move list, the tried-quiet list, and the tried-capture list — and freed
+    /// them again microseconds later. At `588k` nodes per second that is over
+    /// a million malloc/free pairs a second spent on scratch that is the same
+    /// shape every time. No competitive engine allocates per node; they all
+    /// carry a preallocated move stack, which is what these are.
+    move_scratch: Vec<Vec<Move>>,
+    /// Used for the per-ply tried-quiet bookkeeping buffer.
+    quiet_scratch: Vec<Vec<(u16, Move)>>,
+    /// Used for the per-ply tried-capture bookkeeping buffer.
+    capture_scratch: Vec<Vec<usize>>,
+    /// Used for storing the four-ply piece-square continuation-history table.
+    ///
+    /// Alternative configuration retained for controlled evaluation.
+    continuation_four: Vec<i16>,
     /// Used for selecting the research flavors active in this search.
     research: ResearchSearch,
     /// Used for storing the structural correction tables, laid out as side to
@@ -2317,9 +4034,13 @@ struct SearchContext<'a, E, const FRACTIONAL_LMR: bool = false, const LMR_BIAS_U
     ///
     /// Empty when [`CorrectionHistoryMode::Off`] is selected, so the released
     /// searcher allocates nothing and reads nothing.
-    correction_history: Vec<CorrectionEntry>,
+    correction_history: &'a mut [CorrectionEntry],
     /// Used for retaining two quiet cutoff moves at each search ply.
     killers: [[u16; 2]; MAX_SEARCH_PLY],
+    /// Alternative configuration retained for controlled evaluation.
+    ///
+    /// Alternative configuration retained for controlled evaluation.
+    counter_moves: Vec<u16>,
     /// Used for holding the transposition move excluded by an active
     /// singular verification at each ply, or [`NO_MOVE`].
     ///
@@ -2349,6 +4070,31 @@ struct SearchContext<'a, E, const FRACTIONAL_LMR: bool = false, const LMR_BIAS_U
     /// [`SINGLE_REPLY_SOFT_CAP_MILLIS`]; hard deadlines and fixed-node or
     /// fixed-depth budgets are unaffected.
     single_reply_root: bool,
+    /// Used for remembering the last root move whose full-window search raised
+    /// alpha inside the iteration currently under way, with the score it
+    /// proved.
+    ///
+    /// Written only when [`ResearchSearch::accept_partial_root`] is set, and
+    /// read only by the iterative-deepening drivers after `negamax` has
+    /// returned `None`. It is cleared by [`Self::clear_root_pv`] so it always
+    /// belongs to the aspiration attempt in progress.
+    partial_root: Option<(Move, i32)>,
+    /// Used for naming the move the previous completed iteration selected.
+    ///
+    /// Set by the iterative-deepening drivers before each iteration, and used
+    /// only to recognise that move when it is searched at the root so that an
+    /// accepted partial improvement can be compared against it *at the same
+    /// depth*.
+    root_previous_best: Option<Move>,
+    /// Used for holding the score the previous iteration's best move earned in
+    /// the iteration currently under way.
+    ///
+    /// This is the only baseline against which a partial improvement is
+    /// meaningful: the previous iteration's own score belongs to a shallower
+    /// search and root alpha opens a window below it, so neither is a
+    /// comparison. Cleared by [`Self::clear_root_pv`] with the rest of the
+    /// attempt's state.
+    root_previous_best_score: Option<i32>,
 }
 
 impl<'a, E: SearchEvaluator, const FRACTIONAL_LMR: bool, const LMR_BIAS_UNITS: i32>
@@ -2370,7 +4116,9 @@ impl<'a, E: SearchEvaluator, const FRACTIONAL_LMR: bool, const LMR_BIAS_UNITS: i
     /// * `tb_cardinality` - piece-count gate for interior probes, already
     ///   adjusted by any root-ranking outcome; zero disables probing
     /// * `research` - research flavors active for this search; the default
-    ///   value allocates no correction workspace and changes no behavior
+    ///   value changes no behavior
+    /// * `correction_history` - structural correction tables borrowed from the
+    ///   searcher so they survive between moves
     ///
     /// # Returns
     ///
@@ -2392,17 +4140,19 @@ impl<'a, E: SearchEvaluator, const FRACTIONAL_LMR: bool, const LMR_BIAS_UNITS: i
         syzygy: Option<&'a mut Prober>,
         tb_cardinality: usize,
         research: ResearchSearch,
+        correction_history: &'a mut [CorrectionEntry],
+        eval_cache: &'a mut EvaluationCache,
     ) -> Result<Self, SearchError> {
-        let eval_cache =
-            EvaluationCache::try_new(EVAL_CACHE_SIZE.load(std::sync::atomic::Ordering::Relaxed))?;
-        let history = try_filled_vec(64 * 64, 0)?;
+        let history = try_filled_vec(2 * 64 * 64, 0)?;
         let capture_history = try_filled_vec(CAPTURE_HISTORY_BUCKETS, 0)?;
         let continuation_one = try_filled_vec(CONTINUATION_BUCKETS * CONTINUATION_BUCKETS, 0)?;
         let continuation_two = try_filled_vec(CONTINUATION_BUCKETS * CONTINUATION_BUCKETS, 0)?;
-        let correction_history = try_filled_vec(
-            2 * research.correction.table_count() * CORRECTION_ENTRIES,
-            CorrectionEntry::default(),
-        )?;
+        let continuation_four = if research.continuation_four {
+            try_filled_vec(CONTINUATION_BUCKETS * CONTINUATION_BUCKETS, 0)?
+        } else {
+            Vec::new()
+        };
+
         let pv = try_pv_rows()?;
         let incremental_evaluator = evaluator.uses_incremental_search_state();
         Ok(Self {
@@ -2423,11 +4173,22 @@ impl<'a, E: SearchEvaluator, const FRACTIONAL_LMR: bool, const LMR_BIAS_UNITS: i
             incremental_evaluator,
             history,
             capture_history,
+            move_scratch: (0..=MAX_SEARCH_PLY)
+                .map(|_| Vec::with_capacity(64))
+                .collect(),
+            quiet_scratch: (0..=MAX_SEARCH_PLY)
+                .map(|_| Vec::with_capacity(32))
+                .collect(),
+            capture_scratch: (0..=MAX_SEARCH_PLY)
+                .map(|_| Vec::with_capacity(32))
+                .collect(),
             continuation_one,
             continuation_two,
+            continuation_four,
             research,
             correction_history,
             killers: [[NO_MOVE; 2]; MAX_SEARCH_PLY],
+            counter_moves: vec![NO_MOVE; CONTINUATION_BUCKETS],
             excluded_moves: [NO_MOVE; MAX_SEARCH_PLY],
             path_keys: [0; MAX_SEARCH_PLY],
             path_context: [NO_CONTINUATION; MAX_SEARCH_PLY],
@@ -2436,14 +4197,50 @@ impl<'a, E: SearchEvaluator, const FRACTIONAL_LMR: bool, const LMR_BIAS_UNITS: i
             pv,
             root_moves: None,
             single_reply_root: false,
+            partial_root: None,
+            root_previous_best: None,
+            root_previous_best_score: None,
         })
     }
 
-
     /// Used for discarding the previous root PV before a new aspiration
     /// attempt.
+    ///
+    /// The partial-root record is discarded with it: a score proven under one
+    /// aspiration window says nothing under the next, so each attempt starts
+    /// with no claim.
     fn clear_root_pv(&mut self) {
         self.pv[0].clear();
+        self.partial_root = None;
+        self.root_previous_best_score = None;
+    }
+
+    /// Used for reading the root improvement proven inside an aborted
+    /// iteration.
+    ///
+    /// The pair is meaningful only after `negamax` returned `None` for the
+    /// root: at that instant the recorded move is the last one to raise root
+    /// alpha, and because a root alpha raise that reached beta would have cut
+    /// the move loop instead of aborting, the recorded score is an exact
+    /// value inside the aspiration window rather than a bound.
+    ///
+    /// # Returns
+    ///
+    /// The proven root move and its score, or `None` when no root move raised
+    /// alpha in the attempt or the flavour is off.
+    fn partial_root_improvement(&self) -> Option<(Move, i32)> {
+        self.partial_root
+    }
+
+    /// Used for reading what the previous iteration's move earned in the
+    /// aborted iteration.
+    ///
+    /// # Returns
+    ///
+    /// The score, or `None` when the budget expired before that move's root
+    /// search finished.
+    fn root_previous_best_score(&self) -> Option<i32> {
+        self.root_previous_best_score
     }
 
     /// Used for cloning the principal variation assembled at the root.
@@ -2469,7 +4266,7 @@ impl<'a, E: SearchEvaluator, const FRACTIONAL_LMR: bool, const LMR_BIAS_UNITS: i
     /// # Returns
     ///
     /// `true` when the search must stop before starting another iteration.
-    fn should_stop_before_iteration(&mut self, stable_iterations: u8) -> bool {
+    fn should_stop_before_iteration(&mut self, stable_iterations: u8, dropped: i32) -> bool {
         if self.stop.load(Ordering::Relaxed) {
             self.stopped = true;
             return true;
@@ -2483,14 +4280,14 @@ impl<'a, E: SearchEvaluator, const FRACTIONAL_LMR: bool, const LMR_BIAS_UNITS: i
             return true;
         }
         if let Some(soft) = self.limits.soft_time {
-            let scaled = self.scaled_soft_budget(soft, stable_iterations);
+            let scaled = self.scaled_soft_budget(soft, stable_iterations, dropped);
             if self.started.elapsed() >= scaled {
                 self.stopped = true;
                 return true;
             }
         }
         if let Some((soft, elapsed)) = self.limits.live_soft_state() {
-            let scaled = self.scaled_soft_budget(soft, stable_iterations);
+            let scaled = self.scaled_soft_budget(soft, stable_iterations, dropped);
             if elapsed >= scaled {
                 self.stopped = true;
                 return true;
@@ -2516,12 +4313,17 @@ impl<'a, E: SearchEvaluator, const FRACTIONAL_LMR: bool, const LMR_BIAS_UNITS: i
     /// # Returns
     ///
     /// The scaled soft budget to compare against elapsed time.
-    fn scaled_soft_budget(&self, soft: Duration, stable_iterations: u8) -> Duration {
+    fn scaled_soft_budget(&self, soft: Duration, stable_iterations: u8, dropped: i32) -> Duration {
         let mut soft_millis = duration_millis(soft);
         if self.single_reply_root {
             soft_millis = soft_millis.min(SINGLE_REPLY_SOFT_CAP_MILLIS);
         }
-        Duration::from_millis(stability_budget_millis(soft_millis, stable_iterations))
+        let stable = stability_budget_millis(soft_millis, stable_iterations);
+        Duration::from_millis(falling_eval_budget_millis(
+            stable,
+            dropped,
+            self.research.falling_eval_percent,
+        ))
     }
 
     /// Used for accounting one node and enforcing hard limits at bounded
@@ -2789,9 +4591,9 @@ impl<'a, E: SearchEvaluator, const FRACTIONAL_LMR: bool, const LMR_BIAS_UNITS: i
         // end-of-node update. A checked node has no static evaluation and can
         // neither read nor teach the tables.
         let correction_keys = if self.research.correction.is_enabled() && !in_check {
-            self.correction_keys(position)
+            self.correction_keys(position, ply)
         } else {
-            [0; 3]
+            [0; 4]
         };
         let static_eval = if in_check {
             self.static_evals[ply] = NO_STATIC_SCORE;
@@ -2807,10 +4609,63 @@ impl<'a, E: SearchEvaluator, const FRACTIONAL_LMR: bool, const LMR_BIAS_UNITS: i
             bound_aligned_tt_estimate(static_eval, score, hit.payload.bound())
         });
 
+        // Internal iterative reduction. A node deep enough to deserve a full
+        // search but holding no transposition move has almost certainly never
+        // been searched, so its move ordering is a guess — and searching a
+        // guessed ordering at full depth is the most expensive way to find out
+        // what the ordering should have been. Every engine in the reference
+        // tree spends one ply less instead and lets the next visit, which will
+        // have a transposition move, spend the depth properly: Stockfish at
+        // `depth >= 6`, Ethereal at `>= 7`, Berserk at `>= 4`.
+        if self.research.internal_iterative_reduction > 0
+            && !in_check
+            && !exclusion_active
+            && tt_move.is_none()
+            && depth >= self.research.internal_iterative_reduction
+        {
+            depth -= 1;
+        }
+
         if !pv_node && !in_check && !exclusion_active {
-            if depth <= REVERSE_FUTILITY_MAX_DEPTH
+            // Razoring. When the static evaluation sits hopelessly below alpha
+            // the node is very unlikely to raise it, so the quiescence value
+            // is returned instead of searching. Janus has never had this;
+            // Stockfish applies it at `eval < alpha - 483 - 318 * depth^2`.
+            //
+            // The quadratic is what makes it safe: at depth one the gap is a
+            // few pawns, and by depth four it is far beyond anything a quiet
+            // move recovers. Verifying through quiescence rather than
+            // returning `alpha` outright keeps tactics from being discarded.
+            if self.research.razor_scale > 0
+                && depth > 0
+                && depth <= RAZOR_MAX_DEPTH
+                && static_eval != NO_STATIC_SCORE
+                && alpha.abs() < MATE_THRESHOLD
+                && static_eval
+                    + self.research.razor_base
+                    + self.research.razor_scale * depth * depth
+                    < alpha
+            {
+                let value = self.quiescence(
+                    position,
+                    alpha,
+                    beta,
+                    ply,
+                    0,
+                    true,
+                    false,
+                    Some(repetition_key),
+                )?;
+                if value < alpha && value.abs() < MATE_THRESHOLD {
+                    return Some(value);
+                }
+            }
+
+            if depth <= self.research.reverse_futility_max_depth
                 && beta.abs() < MATE_THRESHOLD
-                && estimated_eval - REVERSE_FUTILITY_MARGIN * (depth - i32::from(improving)) >= beta
+                && estimated_eval
+                    - self.research.margin(REVERSE_FUTILITY_MARGIN) * (depth - i32::from(improving))
+                    >= beta
             {
                 return Some(estimated_eval);
             }
@@ -2821,10 +4676,12 @@ impl<'a, E: SearchEvaluator, const FRACTIONAL_LMR: bool, const LMR_BIAS_UNITS: i
                 && estimated_eval >= beta
                 && has_null_move_material(position)
             {
-                let reduction = i32::from(null_move_reduction(
+                let reduction = i32::from(null_move_reduction_tuned(
                     u8::try_from(depth.min(63)).expect("positive search depth fits u8"),
                     estimated_eval,
                     beta,
+                    self.research.null_move_base,
+                    self.research.null_move_depth_divisor,
                 ));
                 let reduced_depth = (depth - 1 - reduction).max(0);
                 let undo = position
@@ -2888,7 +4745,9 @@ impl<'a, E: SearchEvaluator, const FRACTIONAL_LMR: bool, const LMR_BIAS_UNITS: i
                 .as_ref()
                 .map_or_else(|| position.legal_moves(), |moves| moves.to_vec())
         } else {
-            position.legal_moves()
+            let mut buffer = std::mem::take(&mut self.move_scratch[ply]);
+            position.legal_moves_into(&mut buffer);
+            buffer
         };
         if moves.is_empty() {
             return Some(terminal_score(in_check, ply_u16(ply)));
@@ -2905,7 +4764,7 @@ impl<'a, E: SearchEvaluator, const FRACTIONAL_LMR: bool, const LMR_BIAS_UNITS: i
                 hit.payload.bound(),
                 score,
             ) {
-                let singular_beta = score - SINGULAR_MARGIN * depth / 64;
+                let singular_beta = score - self.research.margin(SINGULAR_MARGIN) * depth / 64;
                 let value =
                     self.singular_verification_value(position, depth, ply, mv, singular_beta)?;
                 // Multi-cut: even with the stored move excluded the remaining
@@ -2927,16 +4786,21 @@ impl<'a, E: SearchEvaluator, const FRACTIONAL_LMR: bool, const LMR_BIAS_UNITS: i
         let mut best_move = None;
         let mut best_capture = None;
         let mut searched = 0_u16;
-        let mut tried_quiets = Vec::with_capacity(32);
-        let mut tried_captures = Vec::with_capacity(32);
-        for mv in moves {
+        let mut tried_quiets = std::mem::take(&mut self.quiet_scratch[ply]);
+        let mut tried_captures = std::mem::take(&mut self.capture_scratch[ply]);
+        tried_quiets.clear();
+        tried_captures.clear();
+        let mut move_index = 0_usize;
+        while move_index < moves.len() {
+            let mv = moves[move_index];
+            move_index += 1;
             if exclusion_active && mv.raw() == excluded {
                 continue;
             }
             let tactical = position.is_capture(mv) || mv.promotion().is_some();
             let capture_index = capture_history_index(position, mv);
             let quiet_target = (!tactical).then(|| continuation_target(position, mv));
-            let history_score = self.history[history_index(mv)];
+            let history_score = self.history[self.history_slot(position, mv)];
             let continuation_score =
                 quiet_target.map_or(0, |target| self.continuation_score(ply, target));
             let futility = static_eval != NO_STATIC_SCORE
@@ -2944,25 +4808,79 @@ impl<'a, E: SearchEvaluator, const FRACTIONAL_LMR: bool, const LMR_BIAS_UNITS: i
                 && !in_check
                 && !tactical
                 && searched > 0
-                && depth <= FUTILITY_MAX_DEPTH
+                && depth <= self.research.futility_max_depth
                 && !self.is_killer(ply, mv)
                 && alpha.abs() < MATE_THRESHOLD
-                && static_eval + FUTILITY_MARGIN * depth <= alpha;
+                && static_eval + self.research.margin(FUTILITY_MARGIN) * depth <= alpha;
             let late_move_prune = static_eval != NO_STATIC_SCORE
                 && !pv_node
                 && !in_check
                 && !tactical
-                && depth <= LATE_MOVE_PRUNING_MAX_DEPTH
+                && depth <= self.research.late_move_pruning_max_depth
                 && !self.is_killer(ply, mv)
                 && alpha.abs() < MATE_THRESHOLD
                 && searched
-                    >= late_move_prune_threshold(
+                    >= late_move_prune_threshold_scaled(
                         u8::try_from(depth.max(0)).expect("shallow depth fits u8"),
-                    )
+                        self.research.late_move_pruning_threshold_percent,
+                    ) / if self.research.late_move_pruning_improving_split && !improving {
+                        2
+                    } else {
+                        1
+                    }
                 && history_score <= depth * depth
                 && (self.research.eval_free_late_move_pruning
-                    || static_eval + FUTILITY_MARGIN * depth <= alpha);
-            if futility || late_move_prune {
+                    || static_eval + self.research.margin(FUTILITY_MARGIN) * depth <= alpha);
+            // Continuation-history pruning. The score is already computed
+            // above for ordering, so this costs one comparison.
+            let continuation_prune = self.research.continuation_prune_scale > 0
+                && !pv_node
+                && !in_check
+                && !tactical
+                && searched > 0
+                && depth > 0
+                && !self.is_killer(ply, mv)
+                && alpha.abs() < MATE_THRESHOLD
+                && continuation_score < -self.research.continuation_prune_scale * depth;
+            // The exchange simulation is the most expensive term here, so it
+            // is last: every cheap gate short-circuits ahead of it.
+            let quiet_see_prune = self.research.quiet_see_prune_margin > 0
+                && !pv_node
+                && !in_check
+                && !tactical
+                && searched > 0
+                && depth > 0
+                && depth <= QUIET_SEE_PRUNE_MAX_DEPTH
+                && !self.is_killer(ply, mv)
+                && alpha.abs() < MATE_THRESHOLD
+                && self.quiet_exchange(position, mv) < -self.quiet_see_threshold(depth);
+            // Capture pruning that does not switch off with depth. Both gates
+            // are cheap before the exchange simulation, which runs last.
+            let capture_prune = tactical
+                && position.is_capture(mv)
+                && ply > 0
+                && !pv_node
+                && !in_check
+                && searched > 0
+                && depth > 0
+                && alpha.abs() < MATE_THRESHOLD
+                && beta.abs() < MATE_THRESHOLD
+                && (
+                    // Futility: even winning the victim leaves the node short.
+                    (self.research.capture_futility_scale > 0
+                        && static_eval != NO_STATIC_SCORE
+                        && depth <= QUIET_SEE_PRUNE_MAX_DEPTH
+                        && static_eval
+                            + captured_value(position, mv)
+                            + self.research.capture_futility_scale * depth
+                            <= alpha)
+                        // Exchange: tolerance grows with depth.
+                        || (self.research.capture_see_prune_scale > 0
+                            && static_exchange_eval::<false>(position, mv)
+                                < -self.research.capture_see_prune_scale * depth)
+                );
+            if futility || late_move_prune || quiet_see_prune || continuation_prune || capture_prune
+            {
                 continue;
             }
 
@@ -2981,7 +4899,7 @@ impl<'a, E: SearchEvaluator, const FRACTIONAL_LMR: bool, const LMR_BIAS_UNITS: i
                 continue;
             }
             if let Some(target) = quiet_target {
-                tried_quiets.push(target);
+                tried_quiets.push((target, mv));
             }
             if let Some(index) = capture_index {
                 if tried_captures.len() < 32 && !tried_captures.contains(&index) {
@@ -3015,6 +4933,7 @@ impl<'a, E: SearchEvaluator, const FRACTIONAL_LMR: bool, const LMR_BIAS_UNITS: i
             } else {
                 let reduction = late_move_reduction_for::<FRACTIONAL_LMR, LMR_BIAS_UNITS>(
                     LateMoveReductionContext {
+                        min_searched: self.research.late_move_reduction_min_searched,
                         node: if pv_node {
                             LmrNode::PrincipalVariation
                         } else {
@@ -3034,7 +4953,9 @@ impl<'a, E: SearchEvaluator, const FRACTIONAL_LMR: bool, const LMR_BIAS_UNITS: i
                         child_depth,
                     },
                 );
-                let reduced_depth = (child_depth - reduction).max(0);
+                // Historical calibration detail omitted from the public source release.
+                let reduced_depth = (child_depth - reduction)
+                    .max(LATE_MOVE_REDUCTION_MIN_CHILD_DEPTH.min(child_depth.max(0)));
                 let mut candidate = self
                     .negamax(
                         position,
@@ -3047,7 +4968,10 @@ impl<'a, E: SearchEvaluator, const FRACTIONAL_LMR: bool, const LMR_BIAS_UNITS: i
                     )
                     .map(|value| -value);
                 if let Some(value) = candidate {
-                    if reduction > 0 && value > alpha {
+                    // The floor can swallow a reduction entirely; re-searching
+                    // an identical subtree would be pure waste, so the guard
+                    // tests that the probe was actually shallower.
+                    if reduction > 0 && reduced_depth < child_depth && value > alpha {
                         candidate = self
                             .negamax(
                                 position,
@@ -3074,6 +4998,13 @@ impl<'a, E: SearchEvaluator, const FRACTIONAL_LMR: bool, const LMR_BIAS_UNITS: i
             let score = score?;
             searched = searched.saturating_add(1);
 
+            // The previous iteration's move is ordered first and is the only
+            // baseline a partial improvement can honestly be measured against,
+            // because it is the one alternative searched at this same depth.
+            if self.research.accept_partial_root && ply == 0 && self.root_previous_best == Some(mv)
+            {
+                self.root_previous_best_score = Some(score);
+            }
             if score > best_score {
                 best_score = score;
                 best_move = Some(mv);
@@ -3082,11 +5013,22 @@ impl<'a, E: SearchEvaluator, const FRACTIONAL_LMR: bool, const LMR_BIAS_UNITS: i
             if score > alpha {
                 alpha = score;
                 self.update_pv(ply, mv);
+                // The root verdict for this move is now proven inside the
+                // aspiration window: only a later root move can displace it,
+                // and if the budget expires before one does, the driver may
+                // keep it instead of discarding the whole iteration.
+                if self.research.accept_partial_root && ply == 0 {
+                    self.partial_root = Some((mv, score));
+                }
             }
             if alpha >= beta {
                 if !tactical {
                     self.record_killer(ply, mv);
-                    self.update_history(mv, depth);
+                    self.record_counter_move(ply, mv);
+                    self.update_history(position, mv, depth);
+                    if self.research.history_malus {
+                        self.penalize_tried_quiets(position, mv, &tried_quiets, depth);
+                    }
                     self.update_continuation(ply, quiet_target, &tried_quiets, depth);
                 }
                 break;
@@ -3102,6 +5044,12 @@ impl<'a, E: SearchEvaluator, const FRACTIONAL_LMR: bool, const LMR_BIAS_UNITS: i
         if best_score > alpha_original {
             self.update_capture_history(best_capture, &tried_captures, depth);
         }
+        // Hand the scratch back for the next visit to this ply. Interrupted
+        // searches skip this and simply reallocate once, which costs nothing
+        // because the search is ending.
+        self.quiet_scratch[ply] = tried_quiets;
+        self.capture_scratch[ply] = tried_captures;
+        self.move_scratch[ply] = moves;
         let best_move = best_move.expect("nonterminal node searched at least one move");
         let bound = if best_score <= alpha_original {
             Bound::Upper
@@ -3290,7 +5238,7 @@ impl<'a, E: SearchEvaluator, const FRACTIONAL_LMR: bool, const LMR_BIAS_UNITS: i
         tt_key: u64,
     ) -> ProbcutOutcome {
         debug_assert_ne!(static_eval, NO_STATIC_SCORE);
-        let probcut_beta = beta + PROBCUT_MARGIN;
+        let probcut_beta = beta + self.research.margin(PROBCUT_MARGIN);
         // A trusted transposition score below the raised bound means the node is
         // unlikely to reach probcut_beta, so skip the attempt entirely.
         if tt_score.is_some_and(|score| score < probcut_beta) {
@@ -3302,7 +5250,12 @@ impl<'a, E: SearchEvaluator, const FRACTIONAL_LMR: bool, const LMR_BIAS_UNITS: i
         let mut candidates = position.legal_tactical_moves();
         self.order_moves(position, &mut candidates, tt_move, ply);
         for mv in candidates {
-            if static_exchange_eval(position, mv) < see_threshold {
+            let exchange = if self.research.reconciled_probcut_see {
+                static_exchange_eval::<true>(position, mv)
+            } else {
+                static_exchange_eval::<false>(position, mv)
+            };
+            if exchange < see_threshold {
                 continue;
             }
             let move_context = continuation_target(position, mv);
@@ -3430,7 +5383,9 @@ impl<'a, E: SearchEvaluator, const FRACTIONAL_LMR: bool, const LMR_BIAS_UNITS: i
         }
 
         let tt_key = position.tt_key_from_repetition_key(key);
-        let tt_hit = (qply == 0).then(|| self.table.probe(tt_key)).flatten();
+        let tt_hit = (qply == 0 || self.research.quiescence_tt_all_plies)
+            .then(|| self.table.probe(tt_key))
+            .flatten();
         let tt_move = tt_hit.and_then(|hit| hit.payload.best_move());
         if let Some(hit) = tt_hit {
             let score = score_from_tt(hit.payload.score(), ply_u16(ply));
@@ -3442,7 +5397,56 @@ impl<'a, E: SearchEvaluator, const FRACTIONAL_LMR: bool, const LMR_BIAS_UNITS: i
             }
         }
 
-        let horizon_legal = if !in_check && qply == 0 {
+        let stand_pat = if in_check {
+            -INFINITY
+        } else {
+            // Quiescence reads the same learned structural residual as the
+            // main search but never teaches it: a stand-pat is the evaluator's
+            // own claim, so treating it as evidence about the evaluator would
+            // let the tables reinforce themselves.
+            //
+            // This is also the only place a lazy evaluation is safe to use.
+            // The main search feeds `static_eval` to `improving`, razoring,
+            // futility, probcut *and* the correction-history update, so an
+            // approximation there would be learned and carried to positions
+            // far from the node that took the shortcut. A stand-pat is only
+            // ever compared against the window and returned as a fail-soft
+            // bound: too low and it simply fails to raise alpha, too high and
+            // it is a lower bound, which is what a fail-high returns anyway.
+            //
+            // The correction below shifts the score after the evaluator has
+            // already decided whether to bail, so the lazy margin has to cover
+            // that shift as well. It is bounded and small; the margin is
+            // screened, not derived.
+            let (lazy_alpha, lazy_beta) = if self.research.lazy_eval_margin < 0 {
+                (-INFINITY, INFINITY)
+            } else {
+                (
+                    alpha.saturating_sub(self.research.lazy_eval_margin),
+                    beta.saturating_add(self.research.lazy_eval_margin),
+                )
+            };
+            let raw = self.static_score_in_window(position, key, ply, lazy_alpha, lazy_beta);
+            if self.research.correction.is_enabled() {
+                let keys = self.correction_keys(position, ply);
+                self.apply_correction(raw, position.side_to_move(), keys)
+            } else {
+                raw
+            }
+        };
+        // Stand pat, before a single move is generated. The horizon scan below
+        // costs a full legal move list plus a make and unmake of every move in
+        // it, and a node that fails high on its own static score never reaches
+        // the moves that scan was built for.
+        if !in_check && stand_pat >= beta && !self.research.legacy_horizon_before_stand_pat {
+            if !position.has_legal_move() {
+                return Some(0);
+            }
+            self.store_quiescence(tt_key, stand_pat, alpha_original, beta, None, ply, qply);
+            return Some(stand_pat);
+        }
+
+        let horizon_legal = if !in_check && qply == 0 && self.research.horizon_mate_scan {
             let legal = position.legal_moves();
             if legal.is_empty() {
                 self.store_quiescence(tt_key, 0, alpha_original, beta, None, ply, qply);
@@ -3466,32 +5470,18 @@ impl<'a, E: SearchEvaluator, const FRACTIONAL_LMR: bool, const LMR_BIAS_UNITS: i
             None
         };
         let horizon_checked = horizon_legal.is_some();
-        let stand_pat = if in_check {
-            -INFINITY
-        } else {
-            // Quiescence reads the same learned structural residual as the
-            // main search but never teaches it: a stand-pat is the evaluator's
-            // own claim, so treating it as evidence about the evaluator would
-            // let the tables reinforce themselves.
-            let raw = self.static_score_with_key(position, key, ply);
-            let value = if self.research.correction.is_enabled() {
-                let keys = self.correction_keys(position);
-                self.apply_correction(raw, position.side_to_move(), keys)
-            } else {
-                raw
-            };
-            if value >= beta {
-                if horizon_legal.is_none() && position.legal_moves().is_empty() {
+        if !in_check {
+            if stand_pat >= beta {
+                if horizon_legal.is_none() && !position.has_legal_move() {
                     return Some(0);
                 }
-                self.store_quiescence(tt_key, value, alpha_original, beta, None, ply, qply);
-                return Some(value);
+                self.store_quiescence(tt_key, stand_pat, alpha_original, beta, None, ply, qply);
+                return Some(stand_pat);
             }
-            alpha = alpha.max(value);
-            value
-        };
+            alpha = alpha.max(stand_pat);
+        }
         if qply >= QUIESCENCE_MAX_PLY {
-            if !in_check && horizon_legal.is_none() && position.legal_moves().is_empty() {
+            if !in_check && horizon_legal.is_none() && !position.has_legal_move() {
                 return Some(0);
             }
             return Some(if in_check {
@@ -3512,7 +5502,7 @@ impl<'a, E: SearchEvaluator, const FRACTIONAL_LMR: bool, const LMR_BIAS_UNITS: i
         if moves.is_empty() {
             let score = if in_check {
                 terminal_score(true, ply_u16(ply))
-            } else if !horizon_checked && position.legal_moves().is_empty() {
+            } else if !horizon_checked && !position.has_legal_move() {
                 0
             } else {
                 stand_pat
@@ -3528,7 +5518,10 @@ impl<'a, E: SearchEvaluator, const FRACTIONAL_LMR: bool, const LMR_BIAS_UNITS: i
             if !in_check {
                 if mv.promotion().is_none()
                     && alpha.abs() < MATE_THRESHOLD
-                    && stand_pat + captured_value(position, mv) + DELTA_MARGIN <= alpha
+                    && stand_pat
+                        + self.research.captured_value(position, mv)
+                        + self.research.margin(DELTA_MARGIN)
+                        <= alpha
                 {
                     continue;
                 }
@@ -3603,7 +5596,7 @@ impl<'a, E: SearchEvaluator, const FRACTIONAL_LMR: bool, const LMR_BIAS_UNITS: i
         ply: usize,
         qply: u8,
     ) {
-        if qply != 0 {
+        if qply != 0 && !self.research.quiescence_tt_all_plies {
             return;
         }
         let bound = if score <= alpha_original {
@@ -3657,15 +5650,51 @@ impl<'a, E: SearchEvaluator, const FRACTIONAL_LMR: bool, const LMR_BIAS_UNITS: i
     ///
     /// The clamped static score in centipawns.
     fn static_score_with_key(&mut self, position: &Position, key: u64, ply: usize) -> i32 {
+        self.static_score_in_window(position, key, ply, -INFINITY, INFINITY)
+    }
+
+    /// Used for the static evaluation when the caller has a search window the
+    /// evaluator may exploit.
+    ///
+    /// A lazy evaluator is allowed to skip its expensive terms once the cheap
+    /// ones already stand outside `(alpha, beta)`. The resulting score is
+    /// exact only when it lands inside the window, so **a score that bailed is
+    /// never cached**: the cache is keyed by position alone, and storing a
+    /// window-dependent approximation there would hand it to every later visit
+    /// searching a different window.
+    ///
+    /// # Arguments
+    ///
+    /// * `position` - position to evaluate
+    /// * `key` - evaluation-cache key for `position`
+    /// * `ply` - distance from the root, for incremental evaluators
+    /// * `alpha` - lower bound the caller is searching against
+    /// * `beta` - upper bound the caller is searching against
+    ///
+    /// # Returns
+    ///
+    /// The clamped static score.
+    fn static_score_in_window(
+        &mut self,
+        position: &Position,
+        key: u64,
+        ply: usize,
+        alpha: i32,
+        beta: i32,
+    ) -> i32 {
         if let Some(score) = self.eval_cache.get(key) {
             return score;
         }
-        let score = clamp_static_score(if self.incremental_evaluator {
-            self.evaluator.evaluate_at(position, ply)
-        } else {
-            self.evaluator.evaluate(position)
-        });
-        self.eval_cache.put(key, score);
+        if self.incremental_evaluator {
+            let score = clamp_static_score(self.evaluator.evaluate_at(position, ply));
+            self.eval_cache.put(key, score);
+            return score;
+        }
+        let (raw, exact) = self.evaluator.evaluate_windowed(position, alpha, beta);
+        let score = clamp_static_score(raw);
+        if exact {
+            self.eval_cache.put(key, score);
+        }
         score
     }
 
@@ -3682,16 +5711,55 @@ impl<'a, E: SearchEvaluator, const FRACTIONAL_LMR: bool, const LMR_BIAS_UNITS: i
     /// # Returns
     ///
     /// One key per active correction table, in table order.
-    fn correction_keys(&self, position: &Position) -> [u64; 3] {
+    fn correction_keys(&self, position: &Position, ply: usize) -> [u64; 4] {
         match self.research.correction {
-            CorrectionHistoryMode::Off => [0; 3],
-            CorrectionHistoryMode::Pawn => [pawn_structure_key(position), 0, 0],
+            CorrectionHistoryMode::Off => [0; 4],
+            CorrectionHistoryMode::Pawn => [pawn_structure_key(position), 0, 0, 0],
             CorrectionHistoryMode::PawnAndNonPawn => [
                 pawn_structure_key(position),
                 non_pawn_structure_key(position, Color::White),
                 non_pawn_structure_key(position, Color::Black),
+                0,
+            ],
+            CorrectionHistoryMode::PawnNonPawnAndMajor => [
+                pawn_structure_key(position),
+                non_pawn_structure_key(position, Color::White),
+                non_pawn_structure_key(position, Color::Black),
+                major_structure_key(position),
+            ],
+            CorrectionHistoryMode::PawnNonPawnAndContinuation => [
+                pawn_structure_key(position),
+                non_pawn_structure_key(position, Color::White),
+                non_pawn_structure_key(position, Color::Black),
+                self.continuation_key(ply),
             ],
         }
+    }
+
+    /// Used for deriving the path-based correction key at one ply.
+    ///
+    /// The two preceding move contexts are piece-square encodings already
+    /// maintained for continuation history, so this costs one mix rather than
+    /// a board scan. Near the root, where fewer than two moves precede the
+    /// node, the missing slots stay at their sentinel and every such node
+    /// shares one cell — which is correct, since they share the property of
+    /// having no path.
+    ///
+    /// # Arguments
+    ///
+    /// * `ply` - distance from the search root
+    ///
+    /// # Returns
+    ///
+    /// A 64-bit key determined by how the node was reached.
+    fn continuation_key(&self, ply: usize) -> u64 {
+        let recent = self.path_context[ply];
+        let older = if ply >= 1 {
+            self.path_context[ply - 1]
+        } else {
+            NO_CONTINUATION
+        };
+        mix_bits(u64::from(recent) | (u64::from(older) << 16))
     }
 
     /// Used for locating one correction cell.
@@ -3729,8 +5797,12 @@ impl<'a, E: SearchEvaluator, const FRACTIONAL_LMR: bool, const LMR_BIAS_UNITS: i
     ///
     /// The corrected static evaluation, or `raw` unchanged when correction is
     /// disabled.
-    fn apply_correction(&self, raw: i32, side: Color, keys: [u64; 3]) -> i32 {
-        if !self.research.correction.is_enabled() {
+    /// An empty table means no workspace was supplied, which only happens in
+    /// unit tests that build a context directly; the searcher sizes its tables
+    /// before every real search. Treating it as "correction disabled" keeps
+    /// those tests independent of the released flavour.
+    fn apply_correction(&self, raw: i32, side: Color, keys: [u64; 4]) -> i32 {
+        if !self.research.correction.is_enabled() || self.correction_history.is_empty() {
             return raw;
         }
         let mut total = 0;
@@ -3742,7 +5814,12 @@ impl<'a, E: SearchEvaluator, const FRACTIONAL_LMR: bool, const LMR_BIAS_UNITS: i
         {
             total += self.correction_history[self.correction_slot(side, table, key)].value();
         }
-        clamp_static_score(raw + total / CORRECTION_GRAIN)
+        let scaled = if self.research.correction_gain_percent == 100 {
+            total
+        } else {
+            total * self.research.correction_gain_percent / 100
+        };
+        clamp_static_score(raw + scaled / CORRECTION_GRAIN)
     }
 
     /// Used for blending one node's search-versus-static residual into every
@@ -3763,10 +5840,13 @@ impl<'a, E: SearchEvaluator, const FRACTIONAL_LMR: bool, const LMR_BIAS_UNITS: i
     fn update_correction_history(
         &mut self,
         side: Color,
-        keys: [u64; 3],
+        keys: [u64; 4],
         depth: i32,
         residual: i32,
     ) {
+        if self.correction_history.is_empty() {
+            return;
+        }
         let bonus = (residual * CORRECTION_GRAIN * depth / CORRECTION_BONUS_DIVISOR)
             .clamp(-CORRECTION_MAX_BONUS, CORRECTION_MAX_BONUS);
         for (table, key) in keys
@@ -3927,6 +6007,9 @@ impl<'a, E: SearchEvaluator, const FRACTIONAL_LMR: bool, const LMR_BIAS_UNITS: i
         if Some(mv) == tt_move {
             return 1_000_000;
         }
+        if self.research.flat_move_order {
+            return 0;
+        }
         let moving = position
             .piece_at(mv.from())
             .expect("legal move has a moving piece");
@@ -3945,9 +6028,21 @@ impl<'a, E: SearchEvaluator, const FRACTIONAL_LMR: bool, const LMR_BIAS_UNITS: i
         if let Some(promotion) = mv.promotion() {
             return 80_000 + material_value(promotion);
         }
-        let quiet_score = self.history[history_index(mv)]
+        // The released weight is zero, so the prior is not merely multiplied
+        // away but never computed: skipping it is exactly equivalent and
+        // removes the evaluator call from the hottest loop in move ordering.
+        let prior = if self.research.quiet_order_prior_percent == 0 {
+            0
+        } else {
+            self.evaluator.quiet_move_order_prior(position, mv)
+                * self.research.quiet_order_prior_percent
+                / 100
+        };
+        let quiet_score = self.history[self.history_slot(position, mv)]
             + self.continuation_score(ply, continuation_target(position, mv))
-            + self.evaluator.quiet_move_order_prior(position, mv);
+                * self.research.quiet_order_continuation_percent
+                / 100
+            + prior;
         if ply < MAX_SEARCH_PLY {
             if self.killers[ply][0] == mv.raw() {
                 return 70_000 + quiet_score;
@@ -3955,8 +6050,102 @@ impl<'a, E: SearchEvaluator, const FRACTIONAL_LMR: bool, const LMR_BIAS_UNITS: i
             if self.killers[ply][1] == mv.raw() {
                 return 69_000 + quiet_score;
             }
+            if self.research.counter_move_ordering {
+                let context = usize::from(self.path_context[ply]);
+                if self.path_context[ply] != NO_CONTINUATION
+                    && self.counter_moves.get(context).copied() == Some(mv.raw())
+                {
+                    return 68_000 + quiet_score;
+                }
+            }
+        }
+        // Killers and counter-moves are exempt above: they have already earned
+        // their place by causing a cutoff, and a move that hangs material can
+        // still be the refutation. Only the history-ordered tail is demoted.
+        if self.research.quiet_see_order_penalty != 0
+            && quiet_exchange_eval::<false>(position, mv) < 0
+        {
+            return quiet_score - self.research.quiet_see_order_penalty;
         }
         quiet_score
+    }
+
+    /// Used for penalising every quiet move tried before the cutoff move.
+    ///
+    /// Butterfly history otherwise learns only from moves that succeed, so a
+    /// quiet that is repeatedly tried and repeatedly fails accumulates no
+    /// negative evidence and keeps its ordering position. Continuation history
+    /// already applies this malus; this extends the same treatment to the
+    /// source-destination table.
+    ///
+    /// # Arguments
+    ///
+    /// * `position` - position the moves belong to, supplying the mover
+    /// * `cutoff` - the move that produced the cutoff, which is exempt
+    /// * `tried` - quiet moves searched at this node, cutoff move included
+    /// * `depth` - remaining depth scaling the penalty
+    fn penalize_tried_quiets(
+        &mut self,
+        position: &Position,
+        cutoff: Move,
+        tried: &[(u16, Move)],
+        depth: i32,
+    ) {
+        let penalty = depth.saturating_mul(depth).clamp(1, 2_048);
+        for (_, mv) in tried {
+            if *mv == cutoff {
+                continue;
+            }
+            let index = self.history_slot(position, *mv);
+            let slot = &mut self.history[index];
+            *slot =
+                // Canonical gravity, matching `gravity_i16` and the reward
+                // path: `current + delta - current * |delta| / MAX`, here with
+                // a negative delta.
+                (*slot - penalty - *slot * penalty / HISTORY_MAX).clamp(-HISTORY_MAX, HISTORY_MAX);
+        }
+    }
+
+    /// Used for selecting the butterfly-history cell for one quiet move.
+    ///
+    /// # Arguments
+    ///
+    /// * `position` - position the move belongs to, supplying the mover
+    /// * `mv` - quiet move whose cell is selected
+    ///
+    /// # Returns
+    ///
+    /// Index into the butterfly table under the active flavour.
+    fn history_slot(&self, position: &Position, mv: Move) -> usize {
+        if self.research.colored_history {
+            if let Some(piece) = position.piece_at(mv.from()) {
+                return colored_history_index(piece.color, mv);
+            }
+        }
+        history_index(mv)
+    }
+
+    /// Used for recording the quiet move that refuted a given predecessor.
+    ///
+    /// Keyed by the predecessor's piece-square context rather than by ply, so
+    /// the refutation survives a transposition that reaches the same
+    /// predecessor at a different depth.
+    ///
+    /// # Arguments
+    ///
+    /// * `ply` - distance from the root, selecting the predecessor context
+    /// * `mv` - quiet move that caused the beta cutoff
+    fn record_counter_move(&mut self, ply: usize, mv: Move) {
+        if !self.research.counter_move_ordering || ply >= MAX_SEARCH_PLY {
+            return;
+        }
+        let context = self.path_context[ply];
+        if context == NO_CONTINUATION {
+            return;
+        }
+        if let Some(slot) = self.counter_moves.get_mut(usize::from(context)) {
+            *slot = mv.raw();
+        }
     }
 
     /// Used for promoting a quiet beta-cutoff move into the ply's killer
@@ -3978,11 +6167,13 @@ impl<'a, E: SearchEvaluator, const FRACTIONAL_LMR: bool, const LMR_BIAS_UNITS: i
     ///
     /// # Arguments
     ///
+    /// * `position` - position the move belongs to, supplying the mover
     /// * `mv` - quiet move whose source-destination cell is rewarded
     /// * `depth` - remaining depth scaling the depth-squared bonus
-    fn update_history(&mut self, mv: Move, depth: i32) {
+    fn update_history(&mut self, position: &Position, mv: Move, depth: i32) {
         let bonus = depth.saturating_mul(depth).clamp(1, 2_048);
-        let slot = &mut self.history[history_index(mv)];
+        let index = self.history_slot(position, mv);
+        let slot = &mut self.history[index];
         *slot = (*slot + bonus - *slot * bonus / HISTORY_MAX).clamp(-HISTORY_MAX, HISTORY_MAX);
     }
 
@@ -4008,8 +6199,8 @@ impl<'a, E: SearchEvaluator, const FRACTIONAL_LMR: bool, const LMR_BIAS_UNITS: i
         if target == NO_CONTINUATION {
             return;
         }
-        self.update_history(mv, depth);
-        self.update_continuation(ply, Some(target), &[target], depth);
+        self.update_history(position, mv, depth);
+        self.update_continuation(ply, Some(target), &[(target, mv)], depth);
     }
 
     /// Penalizes a first quiet predecessor when its child has a stored refutation.
@@ -4069,6 +6260,48 @@ impl<'a, E: SearchEvaluator, const FRACTIONAL_LMR: bool, const LMR_BIAS_UNITS: i
     /// # Returns
     ///
     /// `true` when `mv` matches a killer stored at `ply`.
+    /// Used for evaluating a quiet move's destination exchange under the
+    /// flavour's chosen material table.
+    ///
+    /// The table is a compile-time choice inside static exchange evaluation, so
+    /// the runtime flavour selects between two monomorphised instantiations
+    /// here rather than threading a table through the exchange itself.
+    ///
+    /// # Arguments
+    ///
+    /// * `position` - position the quiet move is played from
+    /// * `mv` - quiet move whose destination exchange is simulated
+    ///
+    /// # Returns
+    ///
+    /// The exchange balance from the mover's view, in whichever units the
+    /// flavour selects.
+    /// Used for computing the quiet prune's loss allowance at one depth.
+    ///
+    /// # Arguments
+    ///
+    /// * `depth` - remaining search depth in plies
+    ///
+    /// # Returns
+    ///
+    /// The centipawn loss a quiet move may carry before it is skipped.
+    fn quiet_see_threshold(&self, depth: i32) -> i32 {
+        let margin = self.research.quiet_see_prune_margin;
+        if self.research.quiet_see_linear_margin {
+            margin * depth
+        } else {
+            margin * depth * depth
+        }
+    }
+
+    fn quiet_exchange(&self, position: &Position, mv: Move) -> i32 {
+        if self.research.quiet_see_evaluator_units {
+            quiet_exchange_eval::<true>(position, mv)
+        } else {
+            quiet_exchange_eval::<false>(position, mv)
+        }
+    }
+
     fn is_killer(&self, ply: usize, mv: Move) -> bool {
         ply < MAX_SEARCH_PLY
             && (self.killers[ply][0] == mv.raw() || self.killers[ply][1] == mv.raw())
@@ -4118,6 +6351,17 @@ impl<'a, E: SearchEvaluator, const FRACTIONAL_LMR: bool, const LMR_BIAS_UNITS: i
                 self.continuation_two[continuation_index(self.path_context[ply - 1], target)],
             );
         }
+        // `path_context[ply]` is the move that reached this node, so four
+        // plies back is `ply - 3`. Stockfish 11 consults exactly this third
+        // table; the released Janus search does not allocate it.
+        if !self.continuation_four.is_empty()
+            && ply >= 3
+            && self.path_context[ply - 3] != NO_CONTINUATION
+        {
+            score += i32::from(
+                self.continuation_four[continuation_index(self.path_context[ply - 3], target)],
+            );
+        }
         score
     }
 
@@ -4130,12 +6374,18 @@ impl<'a, E: SearchEvaluator, const FRACTIONAL_LMR: bool, const LMR_BIAS_UNITS: i
     /// * `cutoff` - piece-square target of the cutoff move, if quiet
     /// * `tried` - piece-square targets of the quiets searched at this node
     /// * `depth` - remaining depth scaling the depth-squared signal
-    fn update_continuation(&mut self, ply: usize, cutoff: Option<u16>, tried: &[u16], depth: i32) {
+    fn update_continuation(
+        &mut self,
+        ply: usize,
+        cutoff: Option<u16>,
+        tried: &[(u16, Move)],
+        depth: i32,
+    ) {
         let Some(cutoff) = cutoff else {
             return;
         };
         let bonus = depth.saturating_mul(depth).clamp(1, HISTORY_MAX);
-        for target in tried {
+        for (target, _) in tried {
             let delta = if *target == cutoff { bonus } else { -bonus };
             if self.path_context[ply] != NO_CONTINUATION {
                 let index = continuation_index(self.path_context[ply], *target);
@@ -4144,6 +6394,13 @@ impl<'a, E: SearchEvaluator, const FRACTIONAL_LMR: bool, const LMR_BIAS_UNITS: i
             if ply >= 1 && self.path_context[ply - 1] != NO_CONTINUATION {
                 let index = continuation_index(self.path_context[ply - 1], *target);
                 self.continuation_two[index] = gravity_i16(self.continuation_two[index], delta);
+            }
+            if !self.continuation_four.is_empty()
+                && ply >= 3
+                && self.path_context[ply - 3] != NO_CONTINUATION
+            {
+                let index = continuation_index(self.path_context[ply - 3], *target);
+                self.continuation_four[index] = gravity_i16(self.continuation_four[index], delta);
             }
         }
     }
@@ -4337,6 +6594,27 @@ fn history_index(mv: Move) -> usize {
     usize::from(mv.from().index()) * 64 + usize::from(mv.to().index())
 }
 
+/// Used for mapping a move's mover colour, source and destination to the
+/// colour-separated butterfly-history array.
+///
+/// The released table is `64 x 64` and carries no colour, so White's and
+/// Black's statistics share a cell for every source-destination pair both can
+/// produce — which is every piece move, pawns aside. Capture history is
+/// indexed `12 x 64 x 6` and continuation history `12 x 64`, both of which
+/// separate colour, so the quiet table is the only one that does not.
+///
+/// # Arguments
+///
+/// * `color` - colour of the moving side
+/// * `mv` - move whose source and destination squares are combined
+///
+/// # Returns
+///
+/// A flat index into the `2 x 64 x 64` colour-separated table.
+fn colored_history_index(color: Color, mv: Move) -> usize {
+    color.index() * 64 * 64 + usize::from(mv.from().index()) * 64 + usize::from(mv.to().index())
+}
+
 /// Search-window class used by late-move reduction.
 ///
 /// Principal-variation nodes receive one ply less reduction than cut nodes,
@@ -4369,6 +6647,8 @@ enum LmrMove {
 /// [`late_move_reduction_for`] into a single copyable value.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct LateMoveReductionContext {
+    /// Used for recording the first move index reduction may touch.
+    min_searched: u16,
     /// Used for recording the search-window class of the parent node.
     node: LmrNode,
     /// Used for recording whether the side to move at the parent is in
@@ -4395,11 +6675,7 @@ struct LateMoveReductionContext {
 
 /// Used for selecting one late-move-reduction representation at compile time.
 ///
-/// `FRACTIONAL` is threaded from [`AlphaBeta`]'s const parameter, so the
-/// released build monomorphizes to exactly the whole-ply body it had before
-/// STR-316 and the candidate build to the fractional one. Both share the same
-/// full-depth exemptions, so a move exempt in one flavor is exempt in the
-/// other.
+/// Alternative configuration retained for controlled evaluation.
 ///
 /// # Arguments
 ///
@@ -4414,7 +6690,7 @@ fn late_move_reduction_for<const FRACTIONAL: bool, const BIAS_UNITS: i32>(
     if context.in_check
         || context.move_kind == LmrMove::Tactical
         || context.depth < 3
-        || context.searched < 3
+        || context.searched < context.min_searched
     {
         return 0;
     }
@@ -4461,8 +6737,7 @@ fn released_late_move_reduction(context: LateMoveReductionContext) -> i32 {
     reduction.clamp(0, context.child_depth.max(0))
 }
 
-/// Used for computing the STR-316 fractional late-move reduction of one
-/// already-ordered quiet move.
+/// Alternative configuration retained for controlled evaluation.
 ///
 /// The signals are exactly the released ones and they are combined in the same
 /// directions; only the arithmetic changes. The base curve keeps its own
@@ -4596,6 +6871,44 @@ fn ply_i32(ply: usize) -> i32 {
 /// # Returns
 ///
 /// The kind's coarse material value in centipawns.
+/// Used for valuing a piece on the evaluator's scale.
+///
+/// These are `classical.rs`'s `MATERIAL` values carried through the same
+/// `SEARCH_SCORE_SCALE_PERCENT` calibration that every evaluator score passes
+/// through, so a value returned here is directly comparable with a static
+/// evaluation. The king keeps the search table's sentinel because no
+/// evaluation prices it.
+///
+/// # Arguments
+///
+/// * `kind` - piece kind to value
+///
+/// # Returns
+///
+/// The piece's value in evaluator centipawns.
+/// Used for selecting the material scale a static exchange is measured on.
+///
+/// Alternative configuration retained for controlled evaluation.
+///
+/// # Arguments
+///
+/// * `kind` - piece kind to value
+///
+/// # Returns
+///
+/// The piece's value on the selected scale.
+const fn see_value<const EVALUATOR_UNITS: bool>(kind: PieceKind) -> i32 {
+    if EVALUATOR_UNITS {
+        evaluator_material_value(kind)
+    } else {
+        material_value(kind)
+    }
+}
+
+const fn evaluator_material_value(kind: PieceKind) -> i32 {
+    Classical::research_evaluator_material_value(kind)
+}
+
 const fn material_value(kind: PieceKind) -> i32 {
     match kind {
         PieceKind::Pawn => 100,
@@ -4724,7 +7037,7 @@ fn find_mate_in_one(position: &Position, legal_moves: &[Move]) -> Option<Move> {
         let undo = child
             .make_move(*mv)
             .expect("root legal move is applicable to its position");
-        let checkmate = child.in_check(child.side_to_move()) && child.legal_moves().is_empty();
+        let checkmate = child.in_check(child.side_to_move()) && !child.has_legal_move();
         child.unmake_move(*mv, undo);
         if checkmate {
             return Some(*mv);
@@ -4870,7 +7183,7 @@ fn is_losing_capture(position: &Position, mv: Move) -> bool {
     if victim.color == moving.color || material_value(victim.kind) >= material_value(moving.kind) {
         return false;
     }
-    static_exchange_eval(position, mv) < 0
+    static_exchange_eval::<false>(position, mv) < 0
 }
 
 /// Used for computing conventional pin-agnostic static exchange evaluation in
@@ -4896,10 +7209,7 @@ fn is_losing_capture(position: &Position, mv: Move) -> bool {
 ///
 /// Panics when an en-passant victim square cannot be reconstructed, which
 /// legal en-passant moves prevent.
-fn static_exchange_eval(position: &Position, mv: Move) -> i32 {
-    let Some(moving) = position.piece_at(mv.from()) else {
-        return 0;
-    };
+fn static_exchange_eval<const EVALUATOR_UNITS: bool>(position: &Position, mv: Move) -> i32 {
     let Some(victim) = captured_piece(position, mv) else {
         return 0;
     };
@@ -4909,64 +7219,311 @@ fn static_exchange_eval(position: &Position, mv: Move) -> i32 {
         Square::from_file_row(mv.to().file(), mv.from().row())
             .expect("en-passant captured square is on board")
     };
+    exchange_after_move::<EVALUATOR_UNITS>(
+        position,
+        mv,
+        see_value::<EVALUATOR_UNITS>(victim.kind),
+        Some(capture_square),
+    )
+}
 
-    // Only occupied squares can hold an attacker, so the exchange walks the
-    // occupancy bitboard rather than all sixty-four squares. Empty squares
-    // contributed nothing to either loop, so the simulated exchange is
-    // unchanged.
-    let mut board = [None; 64];
-    let mut occupied = position.occupancy();
-    let mut remaining = occupied;
-    while remaining != 0 {
-        let index = remaining.trailing_zeros();
-        remaining &= remaining - 1;
-        let square = Square::new(u8::try_from(index).expect("bit index is a square"))
-            .expect("occupancy bit is a square");
-        board[index as usize] = position.piece_at(square);
+/// Used for evaluating the exchange a *quiet* move exposes itself to.
+///
+/// Alternative configuration retained for controlled evaluation.
+///
+/// # Arguments
+///
+/// * `position` - position the quiet move is played from
+/// * `mv` - quiet move whose destination exchange is simulated
+///
+/// # Returns
+///
+/// The exchange balance in centipawns from the mover's view; zero or positive
+/// when the destination cannot be profitably taken.
+fn quiet_exchange_eval<const EVALUATOR_UNITS: bool>(position: &Position, mv: Move) -> i32 {
+    if captured_piece(position, mv).is_some() {
+        return 0;
     }
-    board[mv.from().index() as usize] = None;
-    occupied &= !(1_u64 << mv.from().index());
-    board[capture_square.index() as usize] = None;
-    occupied &= !(1_u64 << capture_square.index());
+    let Some(moving) = position.piece_at(mv.from()) else {
+        return 0;
+    };
+    // The simulation's first act is to copy the whole occupancy into a
+    // sixty-four square array, which is by far its cost, and it is wasted
+    // whenever the destination has no enemy attacker at all — the common case
+    // for a quiet move. The test is made against the *post-move* occupancy,
+    // with the mover removed from its origin and placed on the destination,
+    // because a departure can discover a slider onto the square and such an
+    // attacker is real. Under that occupancy an empty attacker set proves the
+    // exchange terminates immediately, and the value the full simulation would
+    // have returned is exactly the promotion gain.
+    let post_move_occupancy =
+        (position.occupancy() & !(1_u64 << mv.from().index())) | (1_u64 << mv.to().index());
+    if !position.is_attacked_under(mv.to(), moving.color.opposite(), post_move_occupancy) {
+        return mv.promotion().map_or(0, |kind| {
+            see_value::<EVALUATOR_UNITS>(kind) - see_value::<EVALUATOR_UNITS>(PieceKind::Pawn)
+        });
+    }
+    exchange_after_move::<EVALUATOR_UNITS>(position, mv, 0, None)
+}
+
+/// Per-target attacker masks for the occupancy-independent piece kinds.
+///
+/// Pawn masks indexed by colour then target square, then the knight and king
+/// masks indexed by target square.
+type SeeAttackerTables = ([[u64; 64]; 2], [u64; 64], [u64; 64]);
+
+/// Used for masking, per target square, the squares a pawn, knight or king
+/// attacks it from.
+///
+/// The three patterns are derived from the very same delta predicates
+/// `piece_attacks` applies, so the tables cannot disagree with the mailbox
+/// reference by construction. Slider attackers are not tabulated: they depend
+/// on occupancy and come from the move generator's magic tables.
+///
+/// # Returns
+///
+/// Pawn attacker masks indexed by colour then target, then the knight and
+/// king attacker masks indexed by target.
+fn see_attacker_tables() -> &'static SeeAttackerTables {
+    static TABLES: std::sync::OnceLock<SeeAttackerTables> = std::sync::OnceLock::new();
+    TABLES.get_or_init(|| {
+        let mut pawns = [[0_u64; 64]; 2];
+        let mut knights = [0_u64; 64];
+        let mut kings = [0_u64; 64];
+        for target in 0_usize..64 {
+            let file = i16::try_from(target % 8).expect("file fits i16");
+            let row = i16::try_from(target / 8).expect("row fits i16");
+            for from in 0_usize..64 {
+                if from == target {
+                    continue;
+                }
+                let from_file = i16::try_from(from % 8).expect("file fits i16");
+                let from_row = i16::try_from(from / 8).expect("row fits i16");
+                let file_delta = file - from_file;
+                let row_delta = row - from_row;
+                let bit = 1_u64 << from;
+                // Mirrors `piece_attacks`: a white pawn attacks one row lower
+                // in index order, a black pawn one row higher.
+                if file_delta.abs() == 1 {
+                    if row_delta == -1 {
+                        pawns[0][target] |= bit;
+                    } else if row_delta == 1 {
+                        pawns[1][target] |= bit;
+                    }
+                }
+                if matches!((file_delta.abs(), row_delta.abs()), (1, 2) | (2, 1)) {
+                    knights[target] |= bit;
+                }
+                if file_delta.abs().max(row_delta.abs()) == 1 {
+                    kings[target] |= bit;
+                }
+            }
+        }
+        (pawns, knights, kings)
+    })
+}
+
+/// Used for indexing the exchange's per-colour bitboards.
+///
+/// # Arguments
+///
+/// * `color` - colour whose slot is wanted
+///
+/// # Returns
+///
+/// `0` for white and `1` for black, matching `see_attacker_tables`.
+const fn see_color_index(color: Color) -> usize {
+    match color {
+        Color::White => 0,
+        Color::Black => 1,
+    }
+}
+
+/// Used for collecting every piece geometrically attacking the contested
+/// square under the exchange's current occupancy.
+///
+/// # Arguments
+///
+/// * `target` - square being fought over
+/// * `occupied` - occupancy of the simulated board
+/// * `by_kind` - piece bitboards of the simulated board, indexed by kind
+/// * `by_color` - colour bitboards of the simulated board
+///
+/// # Returns
+///
+/// Bitboard of attackers, never including the contested square itself.
+#[inline]
+fn see_attackers(target: Square, occupied: u64, by_kind: &[u64; 6], by_color: &[u64; 2]) -> u64 {
+    let (pawns, knights, kings) = see_attacker_tables();
+    let index = target.index();
+    let target_index = usize::from(index);
+    let bishops_queens = by_kind[PieceKind::Bishop.index()] | by_kind[PieceKind::Queen.index()];
+    let rooks_queens = by_kind[PieceKind::Rook.index()] | by_kind[PieceKind::Queen.index()];
+    let pawn_board = by_kind[PieceKind::Pawn.index()];
+    let attackers = (pawns[0][target_index] & pawn_board & by_color[0])
+        | (pawns[1][target_index] & pawn_board & by_color[1])
+        | (knights[target_index] & by_kind[PieceKind::Knight.index()])
+        | (kings[target_index] & by_kind[PieceKind::King.index()])
+        | (janus_core::sliding_attacks::bishop_attacks(index, occupied) & bishops_queens)
+        | (janus_core::sliding_attacks::rook_attacks(index, occupied) & rooks_queens);
+    attackers & occupied & !(1_u64 << index)
+}
+
+/// Used for selecting the attacker the exchange must play next.
+///
+/// The mailbox reference scanned squares in increasing index order and kept
+/// the strictly cheapest, so its rule is *minimum material value, ties broken
+/// by lowest square index*. Knights and bishops are **both worth 300**, which
+/// makes their tie a single tier rather than two: taking knights before
+/// bishops would pick a different attacker whenever a bishop sits on a lower
+/// square, and would not be the same function.
+///
+/// # Arguments
+///
+/// * `attackers` - this side's attackers of the contested square
+/// * `by_kind` - piece bitboards of the simulated board, indexed by kind
+///
+/// # Returns
+///
+/// The chosen attacker's square index and kind, or `None` when the side has
+/// no attacker left.
+#[inline]
+fn see_least_valuable(attackers: u64, by_kind: &[u64; 6]) -> Option<(u8, PieceKind)> {
+    const TIERS: [&[PieceKind]; 5] = [
+        &[PieceKind::Pawn],
+        &[PieceKind::Knight, PieceKind::Bishop],
+        &[PieceKind::Rook],
+        &[PieceKind::Queen],
+        &[PieceKind::King],
+    ];
+    for tier in TIERS {
+        let mut tier_board = 0_u64;
+        for kind in tier {
+            tier_board |= by_kind[kind.index()];
+        }
+        let candidates = attackers & tier_board;
+        if candidates == 0 {
+            continue;
+        }
+        let square = u8::try_from(candidates.trailing_zeros()).expect("set bit is a square");
+        let bit = 1_u64 << square;
+        for kind in tier {
+            if by_kind[kind.index()] & bit != 0 {
+                return Some((square, *kind));
+            }
+        }
+    }
+    None
+}
+
+/// Used for simulating the exchange on a move's destination square.
+///
+/// Shared by the capture and quiet entry points, which differ only in the
+/// balance the exchange opens at and whether a separate square is vacated —
+/// en passant removes a pawn that is not on the destination.
+///
+/// Alternative configuration retained for controlled evaluation.
+///
+/// `mailbox_exchange_after_move` is retained as the reference that
+/// `bitboard_exchange_matches_the_mailbox_reference` compares against.
+///
+/// # Arguments
+///
+/// * `position` - position the move is played from
+/// * `mv` - move whose destination exchange is simulated
+/// * `initial_victim_value` - material the move itself wins, zero for a quiet
+/// * `capture_square` - square the captured piece vacates, if any
+///
+/// # Returns
+///
+/// The exchange balance in centipawns from the mover's view.
+fn exchange_after_move<const EVALUATOR_UNITS: bool>(
+    position: &Position,
+    mv: Move,
+    initial_victim_value: i32,
+    capture_square: Option<Square>,
+) -> i32 {
+    let Some(moving) = position.piece_at(mv.from()) else {
+        return 0;
+    };
+    let target = mv.to();
+    let target_bit = 1_u64 << target.index();
+
+    let mut by_kind = [0_u64; 6];
+    let mut by_color = [0_u64; 2];
+    for kind in PieceKind::ALL {
+        for color in [Color::White, Color::Black] {
+            let board = position.piece_bitboard(Piece::new(color, kind));
+            by_kind[kind.index()] |= board;
+            by_color[see_color_index(color)] |= board;
+        }
+    }
+    let mut occupied = position.occupancy();
+
+    let clear = |bit: u64, by_kind: &mut [u64; 6], by_color: &mut [u64; 2]| {
+        for board in by_kind.iter_mut() {
+            *board &= !bit;
+        }
+        for board in by_color.iter_mut() {
+            *board &= !bit;
+        }
+    };
+    let from_bit = 1_u64 << mv.from().index();
+    clear(from_bit, &mut by_kind, &mut by_color);
+    occupied &= !from_bit;
+    if let Some(square) = capture_square {
+        let bit = 1_u64 << square.index();
+        clear(bit, &mut by_kind, &mut by_color);
+        occupied &= !bit;
+    }
+    // The mailbox reference *assigns* the destination square, so anything
+    // still standing there is replaced rather than merged.
+    clear(target_bit, &mut by_kind, &mut by_color);
     let placed_kind = mv.promotion().unwrap_or(moving.kind);
-    board[mv.to().index() as usize] = Some(Piece::new(moving.color, placed_kind));
-    occupied |= 1_u64 << mv.to().index();
+    by_kind[placed_kind.index()] |= target_bit;
+    by_color[see_color_index(moving.color)] |= target_bit;
+    occupied |= target_bit;
 
     let mut gains = [0_i32; 64];
     let mut gain_count = 1_usize;
     let promotion_gain = mv.promotion().map_or(0, |kind| {
-        material_value(kind) - material_value(PieceKind::Pawn)
+        see_value::<EVALUATOR_UNITS>(kind) - see_value::<EVALUATOR_UNITS>(PieceKind::Pawn)
     });
-    gains[0] = material_value(victim.kind) + promotion_gain;
+    gains[0] = initial_victim_value + promotion_gain;
     let mut occupant = placed_kind;
     let mut side = moving.color.opposite();
 
-    while let Some((attacker_square, attacker)) = least_valuable_attacker(
-        &board,
-        occupied & potential_attacker_mask(mv.to()),
-        mv.to(),
-        side,
-    ) {
-        let next = material_value(occupant) - gains[gain_count - 1];
-        let promoted = attacker.kind == PieceKind::Pawn
-            && ((side == Color::White && mv.to().row() == 0)
-                || (side == Color::Black && mv.to().row() == 7));
+    loop {
+        let attackers = see_attackers(target, occupied, &by_kind, &by_color);
+        let side_attackers = attackers & by_color[see_color_index(side)];
+        let Some((attacker_square, attacker_kind)) = see_least_valuable(side_attackers, &by_kind)
+        else {
+            break;
+        };
+        let next = see_value::<EVALUATOR_UNITS>(occupant) - gains[gain_count - 1];
+        let promoted = attacker_kind == PieceKind::Pawn
+            && ((side == Color::White && target.row() == 0)
+                || (side == Color::Black && target.row() == 7));
         let next_occupant = if promoted {
             PieceKind::Queen
         } else {
-            attacker.kind
+            attacker_kind
         };
         let next = if promoted {
-            next + material_value(PieceKind::Queen) - material_value(PieceKind::Pawn)
+            next + see_value::<EVALUATOR_UNITS>(PieceKind::Queen)
+                - see_value::<EVALUATOR_UNITS>(PieceKind::Pawn)
         } else {
             next
         };
         gains[gain_count] = next;
         gain_count += 1;
-        board[attacker_square.index() as usize] = None;
-        occupied &= !(1_u64 << attacker_square.index());
-        board[mv.to().index() as usize] = Some(Piece::new(side, next_occupant));
-        occupied |= 1_u64 << mv.to().index();
+        let attacker_bit = 1_u64 << attacker_square;
+        clear(attacker_bit, &mut by_kind, &mut by_color);
+        occupied &= !attacker_bit;
+        clear(target_bit, &mut by_kind, &mut by_color);
+        by_kind[next_occupant.index()] |= target_bit;
+        by_color[see_color_index(side)] |= target_bit;
+        occupied |= target_bit;
         occupant = next_occupant;
         side = side.opposite();
     }
@@ -4976,177 +7533,3 @@ fn static_exchange_eval(position: &Position, mv: Move) -> i32 {
     }
     gains[0]
 }
-
-/// Used for masking the squares from which any piece could geometrically
-/// reach a target square.
-///
-/// A square off every rook ray, bishop ray, knight jump and king step from the
-/// target can never attack it under any occupancy, so the static exchange
-/// simulation can skip it without consulting [`piece_attacks`]. Pawn attack
-/// squares are a subset of the king pattern, so they need no separate term.
-///
-/// The table is built once on first use and indexed by target square.
-///
-/// # Arguments
-///
-/// * `target` - square being fought over
-///
-/// # Returns
-///
-/// Bitboard of every square that could hold an attacker of `target`.
-#[inline]
-fn potential_attacker_mask(target: Square) -> u64 {
-    static MASKS: std::sync::OnceLock<[u64; 64]> = std::sync::OnceLock::new();
-    let masks = MASKS.get_or_init(|| {
-        let mut table = [0_u64; 64];
-        for (index, slot) in table.iter_mut().enumerate() {
-            let file = i16::try_from(index % 8).expect("file fits i16");
-            let row = i16::try_from(index / 8).expect("row fits i16");
-            let mut mask = 0_u64;
-            for other in 0_usize..64 {
-                if other == index {
-                    continue;
-                }
-                let other_file = i16::try_from(other % 8).expect("file fits i16");
-                let other_row = i16::try_from(other / 8).expect("row fits i16");
-                let file_delta = file - other_file;
-                let row_delta = row - other_row;
-                let straight = file_delta == 0 || row_delta == 0;
-                let diagonal = file_delta.abs() == row_delta.abs();
-                let knight = matches!((file_delta.abs(), row_delta.abs()), (1, 2) | (2, 1));
-                let king = file_delta.abs().max(row_delta.abs()) == 1;
-                if straight || diagonal || knight || king {
-                    mask |= 1_u64 << other;
-                }
-            }
-            *slot = mask;
-        }
-        table
-    });
-    masks[target.index() as usize]
-}
-
-/// Used for finding the least valuable geometrical attacker of `target` for
-/// `side`.
-///
-/// Ties in material value resolve to the lowest square index, keeping the
-/// exchange simulation deterministic.
-///
-/// # Arguments
-///
-/// * `board` - mailbox board state of the simulated exchange
-/// * `occupied` - squares still holding a piece, already narrowed to those
-///   that can geometrically reach `target`; empty squares cannot hold an
-///   attacker, so the scan visits only set bits
-/// * `target` - square being fought over
-/// * `side` - color whose attackers are considered
-///
-/// # Returns
-///
-/// The attacker's square and piece, or `None` when no attacker remains.
-fn least_valuable_attacker(
-    board: &[Option<Piece>; 64],
-    occupied: u64,
-    target: Square,
-    side: Color,
-) -> Option<(Square, Piece)> {
-    let mut best: Option<(Square, Piece, i32)> = None;
-    let mut remaining = occupied;
-    while remaining != 0 {
-        let index = u8::try_from(remaining.trailing_zeros()).expect("bit index is a square");
-        remaining &= remaining - 1;
-        let square = Square::new(index).expect("occupancy bit is a square");
-        let Some(piece) = board[index as usize] else {
-            continue;
-        };
-        if piece.color != side || !piece_attacks(board, square, target, piece) {
-            continue;
-        }
-        let value = material_value(piece.kind);
-        if best.map_or(true, |(best_square, _, best_value)| {
-            value < best_value || (value == best_value && square < best_square)
-        }) {
-            best = Some((square, piece, value));
-        }
-    }
-    best.map(|(square, piece, _)| (square, piece))
-}
-
-/// Used for testing a piece's geometric attack on a mailbox board without
-/// pin filtering.
-///
-/// # Arguments
-///
-/// * `board` - mailbox board state of the simulated exchange
-/// * `from` - square the piece attacks from
-/// * `target` - square being attacked
-/// * `piece` - piece whose movement pattern is applied
-///
-/// # Returns
-///
-/// `true` when the piece geometrically attacks `target` from `from`.
-fn piece_attacks(board: &[Option<Piece>; 64], from: Square, target: Square, piece: Piece) -> bool {
-    let file_delta = i16::from(target.file()) - i16::from(from.file());
-    let row_delta = i16::from(target.row()) - i16::from(from.row());
-    match piece.kind {
-        PieceKind::Pawn => {
-            row_delta == if piece.color == Color::White { -1 } else { 1 } && file_delta.abs() == 1
-        }
-        PieceKind::Knight => matches!((file_delta.abs(), row_delta.abs()), (1, 2) | (2, 1)),
-        PieceKind::King => file_delta.abs().max(row_delta.abs()) == 1,
-        PieceKind::Bishop => {
-            file_delta.abs() == row_delta.abs()
-                && ray_is_clear(board, from, target, file_delta.signum(), row_delta.signum())
-        }
-        PieceKind::Rook => {
-            (file_delta == 0 || row_delta == 0)
-                && ray_is_clear(board, from, target, file_delta.signum(), row_delta.signum())
-        }
-        PieceKind::Queen => {
-            (file_delta == 0 || row_delta == 0 || file_delta.abs() == row_delta.abs())
-                && ray_is_clear(board, from, target, file_delta.signum(), row_delta.signum())
-        }
-    }
-}
-
-/// Used for testing whether every intermediate square on a slider ray is
-/// empty.
-///
-/// # Arguments
-///
-/// * `board` - mailbox board state of the simulated exchange
-/// * `from` - square the slider starts from
-/// * `target` - square the ray must reach
-/// * `file_step` - per-square file increment of the ray
-/// * `row_step` - per-square row increment of the ray
-///
-/// # Returns
-///
-/// `true` when the ray reaches `target` without hitting a piece or leaving
-/// the board.
-fn ray_is_clear(
-    board: &[Option<Piece>; 64],
-    from: Square,
-    target: Square,
-    file_step: i16,
-    row_step: i16,
-) -> bool {
-    if file_step == 0 && row_step == 0 {
-        return false;
-    }
-    let mut file = i16::from(from.file()) + file_step;
-    let mut row = i16::from(from.row()) + row_step;
-    while file != i16::from(target.file()) || row != i16::from(target.row()) {
-        if !(0..8).contains(&file) || !(0..8).contains(&row) {
-            return false;
-        }
-        let index = usize::try_from(row * 8 + file).expect("checked ray square is non-negative");
-        if board[index].is_some() {
-            return false;
-        }
-        file += file_step;
-        row += row_step;
-    }
-    true
-}
-

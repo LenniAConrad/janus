@@ -67,12 +67,8 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-/// Used for the version reported in the UCI handshake.
-///
-/// Janus releases are dated. Cargo's `version` field must be a semantic
-/// version, so the manifest carries a derived `major.minor.patch` form while
-/// the identity a controller sees keeps the release date itself.
-const ENGINE_VERSION: &str = "2026-08-06";
+/// Used for the dated version reported by the UCI handshake.
+const ENGINE_VERSION: &str = "2026-09-09";
 /// Used for bounding the number of independent alpha-beta workers exposed
 /// through UCI.
 ///
@@ -129,6 +125,18 @@ const TT_ENTRIES_PER_MB: usize = 1 << 15;
 ///
 /// Advertised as the `Move Overhead` spin default.
 const DEFAULT_MOVE_OVERHEAD_MS: u64 = 10;
+/// Used for bounding the accepted `Clock Moves To Go` setting.
+///
+/// Alternative configuration retained for controlled evaluation.
+const MAX_CLOCK_MOVES_TO_GO: u32 = 200;
+/// Used for bounding the accepted `Falling Eval Percent` setting.
+///
+/// Alternative configuration retained for controlled evaluation.
+const MAX_FALLING_EVAL_PERCENT: i32 = 50;
+/// Used for bounding the accepted `Root Fail High Reduction` setting.
+///
+/// Alternative configuration retained for controlled evaluation.
+const MAX_ROOT_FAIL_HIGH_REDUCTION: i32 = 8;
 /// Used for bounding the accepted `Move Overhead` setting in milliseconds.
 ///
 /// The `Move Overhead` spin option advertises this value as its maximum.
@@ -490,10 +498,18 @@ impl SearchEvaluator for JanusEvaluator {
     }
 }
 
-/// Used for evaluating a position with the released hand-crafted evaluator.
+/// Used for completing worker construction without mutable build flavors.
 ///
-/// The classical flavor is immutable and has no UCI control, so a binary
-/// cannot be talked into evaluating differently mid-match.
+/// The public engine has one immutable released search configuration.
+///
+/// # Arguments
+///
+/// * `workers` - freshly constructed search workers
+fn prepare_workers(workers: &mut [AlphaBeta<JanusEvaluator>]) {
+    let _ = workers;
+}
+
+/// Used for evaluating a position with the immutable released classical evaluator.
 ///
 /// # Arguments
 ///
@@ -501,7 +517,7 @@ impl SearchEvaluator for JanusEvaluator {
 ///
 /// # Returns
 ///
-/// Calibrated side-to-move classical score for the compiled flavor.
+/// Calibrated side-to-move classical score.
 fn classical_evaluate_position(position: &Position) -> i32 {
     Classical::evaluate_position(position)
 }
@@ -979,6 +995,18 @@ struct EngineState {
     /// Used for reserving milliseconds from clock-derived hard and soft
     /// budgets.
     move_overhead_ms: u64,
+    /// Used for extending the soft budget when the score is falling.
+    ///
+    /// `0` is the released no-op. Applied to every worker, and re-applied
+    /// whenever the pool is rebuilt, so a `Hash` or `Threads` change cannot
+    /// silently drop it.
+    falling_eval_percent: i32,
+    /// Used for the root fail-high reduction; `1` is the released value.
+    root_fail_high_reduction: i32,
+    /// Used as the fallback divisor when `go` carries no `movestogo`.
+    ///
+    /// Alternative configuration retained for controlled evaluation.
+    clock_moves_to_go: u32,
     /// Used for deciding whether optional protocol diagnostics are enabled.
     debug: bool,
     /// Used for sharing the scanned Syzygy registry with alpha-beta
@@ -1030,6 +1058,9 @@ impl EngineState {
             uci_chess960: false,
             ponder_enabled: false,
             move_overhead_ms: DEFAULT_MOVE_OVERHEAD_MS,
+            clock_moves_to_go: janus_engine::CLOCK_MOVES_TO_GO,
+            falling_eval_percent: 0,
+            root_fail_high_reduction: 1,
             debug: false,
             syzygy: None,
             syzygy_probe_depth: DEFAULT_SYZYGY_PROBE_DEPTH,
@@ -1053,7 +1084,20 @@ impl EngineState {
             self.search_threads
         };
         self.alpha_beta = alpha_beta_workers(&self.active_evaluator, threads, self.hash_mb);
+        self.apply_falling_eval_to_workers();
         self.apply_syzygy_to_workers();
+    }
+
+    /// Used for pushing the falling-eval extension onto every live worker.
+    ///
+    /// Mirrors [`Self::apply_syzygy_to_workers`]. Must be called both when the
+    /// option arrives and whenever the pool is rebuilt, or a `Hash` or
+    /// `Threads` change would silently drop the setting.
+    fn apply_falling_eval_to_workers(&mut self) {
+        for worker in &mut self.alpha_beta {
+            worker.set_falling_eval_percent(self.falling_eval_percent);
+            worker.set_root_fail_high_reduction(self.root_fail_high_reduction);
+        }
     }
 
     /// Used for pushing the current Syzygy configuration onto every
@@ -1678,6 +1722,19 @@ fn write_uci_identity<W: Write>(output: &mut W) -> io::Result<()> {
         "option name Hash type spin default {DEFAULT_HASH_MB} min 1 max {MAX_HASH_MB}"
     )?;
     writeln!(output, "option name Clear Hash type button")?;
+    writeln!(
+        output,
+        "option name Clock Moves To Go type spin default {} min 1 max {MAX_CLOCK_MOVES_TO_GO}",
+        janus_engine::CLOCK_MOVES_TO_GO
+    )?;
+    writeln!(
+        output,
+        "option name Falling Eval Percent type spin default 0 min 0 max {MAX_FALLING_EVAL_PERCENT}"
+    )?;
+    writeln!(
+        output,
+        "option name Root Fail High Reduction type spin default 1 min 0 max {MAX_ROOT_FAIL_HIGH_REDUCTION}"
+    )?;
     #[cfg(feature = "mcts")]
     writeln!(
         output,
@@ -2324,6 +2381,38 @@ fn handle_set_option<W: Write>(
             None => writeln!(
                 output,
                 "info string invalid Syzygy50MoveRule value: {value}"
+            )?,
+        }
+    } else if name.eq_ignore_ascii_case("root fail high reduction") {
+        match value.parse::<i32>() {
+            Ok(reduction) if (0..=MAX_ROOT_FAIL_HIGH_REDUCTION).contains(&reduction) => {
+                state.root_fail_high_reduction = reduction;
+                state.apply_falling_eval_to_workers();
+            }
+            _ => writeln!(
+                output,
+                "info string invalid Root Fail High Reduction value: {value} (expected 0..{MAX_ROOT_FAIL_HIGH_REDUCTION})"
+            )?,
+        }
+    } else if name.eq_ignore_ascii_case("falling eval percent") {
+        match value.parse::<i32>() {
+            Ok(percent) if (0..=MAX_FALLING_EVAL_PERCENT).contains(&percent) => {
+                state.falling_eval_percent = percent;
+                state.apply_falling_eval_to_workers();
+            }
+            _ => writeln!(
+                output,
+                "info string invalid Falling Eval Percent value: {value} (expected 0..{MAX_FALLING_EVAL_PERCENT})"
+            )?,
+        }
+    } else if name.eq_ignore_ascii_case("clock moves to go") {
+        match value.parse::<u32>() {
+            Ok(moves) if (1..=MAX_CLOCK_MOVES_TO_GO).contains(&moves) => {
+                state.clock_moves_to_go = moves;
+            }
+            _ => writeln!(
+                output,
+                "info string invalid Clock Moves To Go value: {value} (expected 1..{MAX_CLOCK_MOVES_TO_GO})"
             )?,
         }
     } else if name.eq_ignore_ascii_case("move overhead") {
@@ -3342,7 +3431,12 @@ fn start_search_with_spawner(
         SearchMode::AlphaBeta => {
             let resources = Arc::new(Mutex::new(Some(std::mem::take(&mut state.alpha_beta))));
             let worker_resources = Arc::clone(&resources);
-            let mut limits = alpha_beta_limits(&options, &root, state.move_overhead_ms);
+            let mut limits = alpha_beta_limits(
+                &options,
+                &root,
+                state.move_overhead_ms,
+                state.clock_moves_to_go,
+            );
             if let Some(clock) = live_clock {
                 limits = limits.with_live_clock(clock);
             }
@@ -3835,6 +3929,7 @@ where
                     return workers;
                 }
                 workers.push(AlphaBeta::with_table(evaluator.clone(), table));
+                prepare_workers(&mut workers);
                 return workers;
             }
             match shrink_entries(entries) {
@@ -3865,6 +3960,7 @@ where
                 Arc::clone(&table),
             ));
         }
+        prepare_workers(&mut workers);
         return workers;
     }
 }
@@ -4771,6 +4867,7 @@ fn mcts_limits(options: &GoOptions, position: &Position, move_overhead_ms: u64) 
 /// * `options` - parsed `go` fields
 /// * `position` - search root deciding whose clock applies
 /// * `move_overhead_ms` - configured clock overhead in milliseconds
+/// * `clock_moves_to_go` - fallback divisor when `go` carries no `movestogo`
 ///
 /// # Returns
 ///
@@ -4779,6 +4876,7 @@ fn alpha_beta_limits(
     options: &GoOptions,
     position: &Position,
     move_overhead_ms: u64,
+    clock_moves_to_go: u32,
 ) -> SearchLimits {
     let mate_depth = options
         .mate
@@ -4805,12 +4903,13 @@ fn alpha_beta_limits(
         janus_core::Color::Black => (options.black_time_ms, options.black_increment_ms),
     };
     if let Some(remaining) = remaining {
+        // An explicit `movestogo` from the GUI still wins; the option only
+        // supplies the fallback for sudden-death-plus-increment controls,
+        // which is what every match in this project actually plays.
         let (soft, hard) = clock_budgets(
             remaining,
             increment.unwrap_or(0),
-            options
-                .moves_to_go
-                .unwrap_or(janus_engine::CLOCK_MOVES_TO_GO),
+            options.moves_to_go.unwrap_or(clock_moves_to_go),
         );
         let overhead = Duration::from_millis(move_overhead_ms);
         let adjusted_hard = hard.saturating_sub(overhead);
@@ -5166,4 +5265,3 @@ fn replay_position(spec: &PositionSpec) -> Result<(Position, Vec<u64>, Vec<Posit
     }
     Ok((position, previous_keys, positions))
 }
-

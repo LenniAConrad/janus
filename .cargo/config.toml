@@ -1,0 +1,7 @@
+# Janus uses population count throughout move generation and evaluation.
+# The checked-in x86-64 profile therefore enables the deterministic `popcnt`
+# instruction. Released x86-64 binaries require an SSE4.2-era CPU; this is not
+# the AVX2/x86-64-v3 tier. An environment `RUSTFLAGS` value replaces this list,
+# so custom release builds must repeat the flag to preserve released throughput.
+[target.'cfg(target_arch = "x86_64")']
+rustflags = ["-C", "target-feature=+popcnt"]

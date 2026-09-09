@@ -11,7 +11,7 @@ use super::{
     Position, BISHOP_DIRECTIONS, KING_OFFSETS, KNIGHT_OFFSETS, QUEEN_DIRECTIONS, ROOK_DIRECTIONS,
 };
 use crate::{Color, Move, Piece, PieceKind, Square};
-use sliding::{bishop_attacks, rook_attacks};
+pub use sliding::{bishop_attacks, rook_attacks};
 use std::sync::OnceLock;
 
 /// Used for sizing the fixed per-ply move scratch, a capacity inherited from
@@ -209,7 +209,6 @@ pub(crate) fn pseudo_legal_moves(position: &Position) -> Vec<Move> {
     moves.to_vec()
 }
 
-
 /// Used for producing every legal move while leaving the caller's immutable
 /// position unchanged.
 ///
@@ -220,6 +219,22 @@ pub(crate) fn pseudo_legal_moves(position: &Position) -> Vec<Move> {
 /// # Returns
 ///
 /// Vector of fully legal moves in stable Janus order.
+pub(crate) fn legal_moves_into(position: &Position, out: &mut Vec<Move>) {
+    let mut legal = MoveBuffer::default();
+    generate_legal_moves(position, &mut legal, false);
+    out.clear();
+    out.extend_from_slice(legal.as_slice());
+}
+
+/// Used for producing every legal move as a freshly allocated vector.
+///
+/// # Arguments
+///
+/// * `position` - position whose side to move is generated for
+///
+/// # Returns
+///
+/// The complete ordered legal move list.
 pub(crate) fn legal_moves(position: &Position) -> Vec<Move> {
     let mut legal = MoveBuffer::default();
     generate_legal_moves(position, &mut legal, false);
@@ -310,6 +325,50 @@ pub(crate) fn count_legal_moves(position: &Position, scratch: &mut MoveBuffer) -
     );
     generate_castles(position, color, &mut emitter);
     bulk + emitter.moves.as_slice().len()
+}
+
+/// Used for deciding only whether the side to move has any legal move.
+///
+/// Callers that ask this question are testing for mate or stalemate, and the
+/// answer is overwhelmingly `true`, so the cost that matters is the cost of
+/// the affirmative case. In the same common case [`count_legal_moves`]
+/// identifies — a present unchecked king, no absolutely pinned friendly
+/// piece, and no usable en-passant target — every movement-correct pawn,
+/// knight, and slider move is legal, so a non-zero bulk popcount already
+/// proves existence and no move is emitted, tested, or stored at all. Only
+/// when that shortcut does not apply does the query fall back to the exact
+/// count.
+///
+/// The result is identical to `!legal_moves(position).is_empty()` by
+/// construction, since the fallback is [`count_legal_moves`], whose count is
+/// pinned to the generated list length by the perft cross-checks.
+///
+/// # Arguments
+///
+/// * `position` - position whose side to move is queried
+///
+/// # Returns
+///
+/// `true` when at least one fully legal move exists.
+pub(crate) fn has_legal_move(position: &Position) -> bool {
+    let color = position.side_to_move;
+    let constraints = LegalConstraints::new(position, color);
+    let common_case = constraints.king.is_some()
+        && constraints.non_king_targets == u64::MAX
+        && constraints.pinned == 0
+        && en_passant_mask(position, color) == 0;
+    // Both operands are non-negative popcount sums, so `a + b > 0` is exactly
+    // `a > 0 || b > 0` -- but `||` stops at the first non-zero instead of
+    // always paying for both. Pawns answer first because they do so most
+    // often. `count_legal_moves` still backs the uncommon cases, and the sum
+    // at the other call site is left alone: there the value IS the count.
+    if common_case
+        && (count_pawn_moves(position, color) > 0 || count_piece_moves(position, color) > 0)
+    {
+        return true;
+    }
+    let mut scratch = MoveBuffer::default();
+    count_legal_moves(position, &mut scratch) > 0
 }
 
 /// Used for computing the geometric attacks produced by the piece occupying
@@ -702,7 +761,6 @@ fn generate_pseudo_legal_moves(position: &Position, moves: &mut MoveBuffer) {
     let mut emitter = PseudoEmitter { moves };
     generate_ordered_moves(position, false, &mut emitter);
 }
-
 
 /// Used for walking every piece family once in the stable observable Janus
 /// order.
@@ -1236,17 +1294,45 @@ fn en_passant_mask(position: &Position, color: Color) -> u64 {
 /// Bitboard of every `by` piece attacking `target` under the current
 /// occupancy.
 fn attackers_to(position: &Position, target: Square, by: Color) -> u64 {
+    attackers_to_with(position, target, by, position.occupancy())
+}
+
+/// Used for finding every `by` piece attacking `target` under a supplied
+/// occupancy.
+///
+/// Identical to [`attackers_to`] except that slider rays are traced through
+/// `occupancy` rather than the position's own. Callers simulating a move —
+/// where a piece has left its origin and may have opened a line — must pass
+/// the post-move occupancy, because an attacker discovered by the departure is
+/// a real attacker and the position's occupancy would hide it.
+///
+/// # Arguments
+///
+/// * `position` - position supplying piece bitboards
+/// * `target` - square under attack
+/// * `by` - attacking color
+/// * `occupancy` - full-board occupancy used for slider lookups
+///
+/// # Returns
+///
+/// Bitboard of every `by` piece attacking `target` under `occupancy`.
+pub(crate) fn attackers_to_with(
+    position: &Position,
+    target: Square,
+    by: Color,
+    occupancy: u64,
+) -> u64 {
     let index = target.index() as usize;
     let queens = position.piece_bitboard(Piece::new(by, PieceKind::Queen));
     let bishop_queens = position.piece_bitboard(Piece::new(by, PieceKind::Bishop)) | queens;
     let rook_queens = position.piece_bitboard(Piece::new(by, PieceKind::Rook)) | queens;
     let bishop_checkers = if attacks().bishop_lines[index] & bishop_queens != 0 {
-        bishop_attacks(target.index(), position.occupancy()) & bishop_queens
+        bishop_attacks(target.index(), occupancy) & bishop_queens
     } else {
         0
     };
     let rook_checkers = if attacks().rook_lines[index] & rook_queens != 0 {
-        rook_attacks(target.index(), position.occupancy()) & rook_queens
+        rook_attacks(target.index(), occupancy) & rook_queens
     } else {
         0
     };
@@ -1347,7 +1433,7 @@ fn same_king_ray(king: Square, from: Square, to: Square) -> bool {
 ///
 /// Bitboard of `color` pieces whose departure would expose the king to an
 /// enemy slider.
-fn pinned_pieces(position: &Position, color: Color) -> u64 {
+pub(crate) fn pinned_pieces(position: &Position, color: Color) -> u64 {
     let Some(king) = position.king_square(color) else {
         return 0;
     };

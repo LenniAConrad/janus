@@ -445,7 +445,6 @@ impl Tablebases {
     pub fn dtz_file_count(&self) -> usize {
         self.dtz_files
     }
-
 }
 
 /// Used for parsing and de-duplicating one separator-delimited tablebase path

@@ -1,14 +1,6 @@
 //! AVX2 leaf backend: audited one-intrinsic wrappers for the NNUE interface.
 //!
-//! This file and the sibling `avx512.rs` are together the entire `unsafe`
-//! surface of the workspace, per the maintainer-approved exception of
-//! 2026-07-23. The workspace-wide `unsafe_code = "forbid"` lint is relaxed
-//! to `deny` for `janus-engine` alone (see the crate's `Cargo.toml`), and
-//! the module-level `#![allow(unsafe_code)]` attributes in these two leaf
-//! files are the only places that override it, so any `unsafe` outside
-//! them still fails the build. At most one of the two leaf backends is
-//! compiled into a given binary: this module yields to `avx512.rs`
-//! whenever the build statically enables `avx512f` and `avx512bw`.
+//! Public implementation detail retained for the released engine.
 //!
 //! Audit contract, checkable line by line:
 //!

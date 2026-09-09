@@ -89,3 +89,10 @@ pub use perft::{
 pub use position::{CastlingRights, NullUndo, Position, Undo, START_FEN};
 pub use square::Square;
 pub use types::{Color, Piece, PieceKind};
+
+/// Magic-bitboard slider attacks, shared with evaluation.
+///
+/// Alternative configuration retained for controlled evaluation.
+pub mod sliding_attacks {
+    pub use crate::position::movegen::{bishop_attacks, rook_attacks};
+}

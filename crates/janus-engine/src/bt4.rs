@@ -1828,4 +1828,3 @@ fn expect_dense(actual: DenseShape, input: u32, output: u32, label: &str) -> Res
 fn shape(message: impl Into<String>) -> Bt4Error {
     Bt4Error::new(Bt4ErrorKind::UnsupportedShape, message)
 }
-

@@ -632,7 +632,6 @@ impl HalfKaRefreshCache {
         Ok(Self { entries })
     }
 
-
     /// Used for selecting the entry anchored at one perspective and king
     /// square.
     ///
@@ -1482,6 +1481,7 @@ impl UpstreamNnueSearchState {
                 &mut refresh_cache,
             );
         }
+
         let _ = root_changed_rows;
         Ok(Self {
             slots,
@@ -1491,7 +1491,6 @@ impl UpstreamNnueSearchState {
             refresh_cache,
         })
     }
-
 
     /// Used for making a null child share its parent's unchanged piece
     /// accumulators.
@@ -1818,7 +1817,6 @@ impl FeatureTransformer {
         slot.psqt[perspective] = entry.psqt;
         changed_rows
     }
-
 
     /// Writes one ordinary child perspective from its parent and feature delta.
     ///
@@ -2159,7 +2157,6 @@ fn write_perspective_features(
     }
 }
 
-
 /// Fixed-capacity sparse view of the transformed 1,024-lane feature vector.
 ///
 /// Indices are appended in increasing dense-lane order. This preserves each
@@ -2190,7 +2187,6 @@ impl SparseTransformedFeatures {
             len: 0,
         }
     }
-
 
     /// Used for recording one nonzero lane in increasing transform order.
     ///
@@ -4502,4 +4498,3 @@ pub mod datagen {
         }
     }
 }
-

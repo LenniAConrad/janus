@@ -296,7 +296,7 @@ impl Bt4BackendStatus {
     /// # Returns
     ///
     /// Status recording the original request now served by the CPU.
-    #[cfg(any(test, feature = "gpu"))]
+    #[cfg(feature = "gpu")]
     pub(crate) fn runtime_fallback(
         requested: Bt4Backend,
         device_index: usize,
@@ -1290,4 +1290,3 @@ fn decode_error(payload: &[u8]) -> String {
     }
     message
 }
-

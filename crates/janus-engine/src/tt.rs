@@ -924,4 +924,3 @@ impl SharedTranspositionTable {
         usize::try_from(mixed & mask).expect("a masked bucket index fits usize")
     }
 }
-

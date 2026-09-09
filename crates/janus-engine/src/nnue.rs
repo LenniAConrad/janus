@@ -847,4 +847,3 @@ impl<'a> LeReader<'a> {
         self.offset == self.bytes.len()
     }
 }
-

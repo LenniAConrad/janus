@@ -11,6 +11,7 @@ description = "Dependency-free search and evaluation algorithms for the Janus ch
 janus-core = { path = "../janus-core" }
 
 [features]
+
 default = ["gpu", "mcts"]
 # OpenCL helper-process client behind Bt4Network. Without it every backend
 # request resolves to the scalar CPU path (Auto records a fallback reason,
@@ -19,15 +20,6 @@ gpu = []
 # PUCT Monte Carlo tree search and its result types.
 mcts = []
 
-
-
-# Mirrors the workspace lint table except for `unsafe_code`. The workspace
-# forbids unsafe outright; `forbid` cannot be overridden by any attribute, so
-# this crate alone relaxes it to `deny` to admit the single maintainer-approved
-# exception (2026-07-23): the module-level `#[allow(unsafe_code)]` attributes
-# inside the leaf backend files `src/upstream_nnue/simd/avx2.rs` and
-# `src/upstream_nnue/simd/avx512.rs`. Every other module in this crate - and
-# every other crate in the workspace - still rejects `unsafe` at compile time.
 [lints.rust]
 unsafe_code = "deny"
 

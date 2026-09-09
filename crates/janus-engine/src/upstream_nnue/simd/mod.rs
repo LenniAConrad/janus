@@ -1,9 +1,6 @@
 //! Backend interface and shared kernels for upstream-NNUE hot arithmetic.
 //!
-//! This module is the audit boundary for the single maintainer-approved
-//! `unsafe` exception (2026-07-23) in the workspace. It defines the
-//! `Backend` trait the hot `upstream_nnue` loops call through the
-//! compile-time `Active` alias. The trait has two layers:
+//! Public implementation detail retained for the released engine.
 //!
 //! * Row-level kernels (`add_i8_row`, `dot_i8_row`, ...) with safe
 //!   flat-loop default bodies that reproduce the former hand-written scalar
@@ -895,4 +892,3 @@ mod chunked {
         count
     }
 }
-

@@ -280,6 +280,42 @@ pub struct Position {
     /// Used for mailbox lookup of per-square piece indices, with [`EMPTY`]
     /// marking vacant squares.
     board: [u8; 64],
+    /// Used for the incrementally maintained piece-placement hash.
+    ///
+    /// [`Position::key`] previously walked all sixty-four mailbox squares and
+    /// folded them with FNV on every call, costing about `37` nanoseconds.
+    /// Search calls it at least once per node, so a million-node search spent
+    /// tens of milliseconds rehashing a board that changed by two squares.
+    /// Every engine in the reference tree instead keeps a hash updated by
+    /// exclusive-or inside piece placement and removal, which is what
+    /// [`Position::put`] and [`Position::take`] now do.
+    ///
+    /// This covers piece placement only; side to move, castling and en passant
+    /// are still folded in by `key`, because they are a handful of cheap words
+    /// rather than a sixty-four iteration loop.
+    piece_key: u64,
+    /// Used for keying a pawn-structure cache.
+    ///
+    /// Incrementally maintained over **pawns only**. That is the exact input
+    /// set of the terms a cache can hold: doubled and isolated penalties come
+    /// from per-file pawn counts, and which pawns are passers is decided by
+    /// intersecting the enemy pawn bitboard with a precomputed mask.
+    ///
+    /// Kings are deliberately excluded even though passer realization reads
+    /// them. Folding them in would invalidate the entry on every king move,
+    /// and in the endgames where this cache matters most the kings move
+    /// constantly — the king-dependent geometry is cheap and is recomputed
+    /// outside the cache instead.
+    ///
+    /// Every classical engine in the reference tree keeps one — Stockfish 11
+    /// probes `Pawns::probe`, Ethereal a `PKTable` of
+    /// `PKEntry { pkhash, passed, eval, safetyw, safetyb }`.
+    ///
+    /// What this key must **not** be used to cache is anything reading a
+    /// non-pawn piece — most importantly whether a passer's front square is
+    /// occupied, which any piece can decide. Stockfish computes that outside
+    /// its pawn hash for the same reason.
+    pawn_key: u64,
     /// Used for caching aggregate occupancy for white and black.
     occupancy: [u64; 2],
     /// Used for caching the king square of each color.
@@ -336,6 +372,60 @@ impl fmt::Debug for Position {
     }
 }
 
+/// Used for one piece-on-square hash contribution.
+///
+/// The table is a deterministic xorshift sequence rather than stored random
+/// data, so the crate embeds no blob and the values are reproducible from the
+/// source alone.
+///
+/// # Arguments
+///
+/// * `piece` - piece occupying the square
+/// * `square` - square the piece sits on
+///
+/// # Returns
+///
+/// The hash contribution to exclusive-or into the running key.
+#[inline]
+fn piece_square_key(piece: Piece, square: Square) -> u64 {
+    PIECE_SQUARE_KEYS[piece.index()][square.index() as usize]
+}
+
+/// Used for the Zobrist piece-square words, built at compile time.
+///
+/// The chain has no runtime input -- it is a fixed xorshift64 seeded with a
+/// literal -- so a `const fn` walking the same nesting order emits the same
+/// 768 words as the previous `OnceLock`. Only the moment of evaluation moves.
+///
+/// The win is not the atomic load. Removing the cold initialiser lets the
+/// caller inline, which is what took make and unmake from `29.3` to `24.4` ns
+/// on Kiwipete. Sizing this with perft would hide it: make/unmake is only
+/// about `0.6` ns of a `3.9` ns perft node.
+static PIECE_SQUARE_KEYS: [[u64; 64]; 12] = build_piece_square_keys();
+
+/// Used for materialising [`PIECE_SQUARE_KEYS`] at compile time.
+///
+/// # Returns
+///
+/// The Zobrist words, in piece-major then square order.
+const fn build_piece_square_keys() -> [[u64; 64]; 12] {
+    let mut state = 0x9E37_79B9_7F4A_7C15_u64;
+    let mut built = [[0_u64; 64]; 12];
+    let mut piece = 0;
+    while piece < 12 {
+        let mut square = 0;
+        while square < 64 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            built[piece][square] = state;
+            square += 1;
+        }
+        piece += 1;
+    }
+    built
+}
+
 impl Position {
     /// Used for creating the orthodox initial position.
     ///
@@ -362,6 +452,8 @@ impl Position {
         Self {
             pieces: [0; 12],
             board: [EMPTY; 64],
+            piece_key: 0,
+            pawn_key: 0,
             occupancy: [0; 2],
             kings: [None; 2],
             side_to_move: Color::White,
@@ -994,6 +1086,25 @@ impl Position {
         self.kings[color.index()]
     }
 
+    /// Used for keying a pawn-structure cache over pawns.
+    ///
+    /// Maintained incrementally by piece placement and removal, so this is a
+    /// field read rather than a board walk.
+    ///
+    /// Two positions sharing this key have identical pawn placement, and
+    /// therefore identical doubled and isolated structure and identical
+    /// passers. They may differ in every other piece — including the kings —
+    /// which is precisely why the cache is worth having: a search re-evaluates
+    /// the same pawn skeleton across most of a subtree.
+    ///
+    /// # Returns
+    ///
+    /// The incremental pawn placement hash.
+    #[must_use]
+    pub const fn pawn_key(&self) -> u64 {
+        self.pawn_key
+    }
+
     /// Used for computing the deterministic repetition key.
     ///
     /// This correctness-first implementation computes the key on demand in
@@ -1006,11 +1117,8 @@ impl Position {
     ///
     /// The clock-free FNV-1a-style hash of the repetition-relevant state.
     pub fn key(&self) -> u64 {
-        let mut hash = FNV_OFFSET;
-        for value in self.board {
-            hash ^= u64::from(value);
-            hash = hash.wrapping_mul(FNV_PRIME);
-        }
+        let mut hash = FNV_OFFSET ^ self.piece_key;
+        hash = hash.wrapping_mul(FNV_PRIME);
         hash ^= self.side_to_move.index() as u64;
         hash = hash.wrapping_mul(FNV_PRIME);
         hash ^= u64::from(self.castling_rights.bits());
@@ -1089,6 +1197,10 @@ impl Position {
     /// In debug builds, asserts that the destination square is empty.
     fn put(&mut self, piece: Piece, square: Square) {
         debug_assert_eq!(self.board[square.index() as usize], EMPTY);
+        self.piece_key ^= piece_square_key(piece, square);
+        if piece.kind == PieceKind::Pawn {
+            self.pawn_key ^= piece_square_key(piece, square);
+        }
         self.board[square.index() as usize] = piece.index() as u8;
         self.pieces[piece.index()] |= square.bit();
         self.occupancy[piece.color.index()] |= square.bit();
@@ -1112,6 +1224,10 @@ impl Position {
     /// The removed piece, or `None` when the square was already empty.
     fn take(&mut self, square: Square) -> Option<Piece> {
         let piece = self.piece_at(square)?;
+        self.piece_key ^= piece_square_key(piece, square);
+        if piece.kind == PieceKind::Pawn {
+            self.pawn_key ^= piece_square_key(piece, square);
+        }
         self.board[square.index() as usize] = EMPTY;
         self.pieces[piece.index()] &= !square.bit();
         self.occupancy[piece.color.index()] &= !square.bit();
@@ -1348,8 +1464,54 @@ impl Position {
         movegen::attacks_for_piece(self, square, piece)
     }
 
+    /// Used for retrieving the pieces absolutely pinned against `color`'s king.
+    ///
+    /// A pinned piece cannot leave its ray without exposing the king, so its
+    /// apparent mobility overstates what it can actually do. That is a
+    /// *relational* fact -- it depends on the king and the enemy sliders, not
+    /// on the piece's square -- which is why a per-square evaluation table
+    /// cannot represent it at any weighting.
+    ///
+    /// This is the same set the legal-move generator computes and relies on,
+    /// so its geometry is already proven by every perft fixture rather than by
+    /// a separate oracle.
+    ///
+    /// # Arguments
+    ///
+    /// * `color` - side whose pinned pieces are collected
+    ///
+    /// # Returns
+    ///
+    /// Bitboard of `color`'s absolutely pinned pieces; zero without a king.
+    #[inline]
+    #[must_use]
+    pub fn absolute_pins(&self, color: Color) -> u64 {
+        movegen::pinned_pieces(self, color)
+    }
 
-
+    /// Used for testing whether a color attacks a square under a supplied
+    /// occupancy.
+    ///
+    /// Slider rays are traced through `occupancy` rather than the position's
+    /// own, so a caller simulating a move can pass the post-move occupancy and
+    /// see attackers that the departure discovers. That exactness is the point:
+    /// a test against the current occupancy would miss a slider whose line the
+    /// moving piece was blocking.
+    ///
+    /// # Arguments
+    ///
+    /// * `square` - square under test
+    /// * `by` - attacking color
+    /// * `occupancy` - full-board occupancy used for slider lookups
+    ///
+    /// # Returns
+    ///
+    /// `true` when any `by` piece attacks `square` under `occupancy`.
+    #[inline]
+    #[must_use]
+    pub fn is_attacked_under(&self, square: Square, by: Color, occupancy: u64) -> bool {
+        movegen::attackers_to_with(self, square, by, occupancy) != 0
+    }
 
     /// Used for testing whether `square` is attacked by `by` in the current
     /// position.
@@ -1368,7 +1530,6 @@ impl Position {
     pub fn is_square_attacked(&self, square: Square, by: Color) -> bool {
         movegen::is_square_attacked(self, square, by)
     }
-
 
     /// Used for testing whether `color`'s king is attacked.
     ///
@@ -1482,8 +1643,6 @@ impl Position {
         movegen::legal_tactical_moves(self)
     }
 
-
-
     /// Used for generating movement-correct moves that may expose the moving
     /// king.
     ///
@@ -1498,7 +1657,6 @@ impl Position {
         movegen::pseudo_legal_moves(self)
     }
 
-
     /// Used for generating every legal move for the side to move.
     ///
     /// Output order is deterministic and follows the crate's
@@ -1512,6 +1670,36 @@ impl Position {
         movegen::legal_moves(self)
     }
 
+    /// Used for generating every legal move into a caller-owned buffer.
+    ///
+    /// Identical output to [`Self::legal_moves`], but the caller keeps the
+    /// allocation across calls. A search visiting a million nodes a second
+    /// otherwise pays a heap allocation and free per node purely to hand back
+    /// a vector it discards immediately.
+    ///
+    /// # Arguments
+    ///
+    /// * `out` - buffer cleared and refilled with the legal moves
+    pub fn legal_moves_into(&self, out: &mut Vec<Move>) {
+        movegen::legal_moves_into(self, out);
+    }
+
+    /// Used for testing whether the side to move has any legal move at all.
+    ///
+    /// This answers the mate-or-stalemate question that search asks on its
+    /// hottest exits, where building the move list only to measure its length
+    /// discards every move it just generated. The result equals
+    /// `!self.legal_moves().is_empty()` exactly, so it is a drop-in
+    /// replacement wherever emptiness is the only thing consulted.
+    ///
+    /// # Returns
+    ///
+    /// `true` when at least one legal move exists; `false` for mate or
+    /// stalemate.
+    #[must_use]
+    pub fn has_legal_move(&self) -> bool {
+        movegen::has_legal_move(self)
+    }
 
     /// Used for testing whether `mv` is an en-passant capture by `moving`.
     ///
@@ -1533,7 +1721,6 @@ impl Position {
             && self.piece_at(mv.to()).is_none()
             && mv.from().file() != mv.to().file()
     }
-
 
     /// Used for resolving a UCI move against this position while requiring
     /// it to be legal.
@@ -1656,17 +1843,6 @@ impl Position {
     pub fn unmake_null(&mut self, undo: NullUndo) {
         transition::unmake_null(self, undo);
     }
-
-
-
-
-
-
-
-
-
-
-
 
     /// Used for checking Chess960-aware king and rook travel paths for
     /// blockers.
@@ -1851,7 +2027,6 @@ impl Position {
         movegen::pawn_attackers(self, target, color)
     }
 
-
     /// Used for retrieving the en-passant target only when at least one
     /// legal capture exists.
     ///
@@ -1881,4 +2056,3 @@ impl Position {
         None
     }
 }
-

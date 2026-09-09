@@ -819,4 +819,3 @@ fn detailed_leaf(
 fn checked_sum(left: u64, right: u64) -> Result<u64, PerftError> {
     left.checked_add(right).ok_or(PerftError::CounterOverflow)
 }
-

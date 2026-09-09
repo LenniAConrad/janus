@@ -1,2 +1,54 @@
-/target
-/dist
+# Rust and native build output.
+/target/
+*.a
+*.dll
+*.dylib
+*.exe
+*.lib
+*.o
+*.obj
+*.pdb
+*.so
+*.so.*
+/native/opencl/janus-bt4-opencl
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+compile_commands.json
+
+# Model weights and training checkpoints are always local inputs.
+/models
+*.bin
+*.ckpt
+*.nnue
+*.onnx
+*.pb
+*.pb.gz
+*.pt
+*.pth
+*.safetensors
+*.weights
+
+# Generated results and local packaging output.
+/artifacts/
+/dist/
+/dump/
+/results/
+*.log
+*.profdata
+*.profraw
+
+# Editor, agent, and operating-system metadata.
+/.agents/
+/.claude/
+/.codex/
+/.fleet/
+/.idea/
+/.vscode/
+*.iml
+*.swp
+*.swo
+*~
+.DS_Store
+Desktop.ini
+Thumbs.db

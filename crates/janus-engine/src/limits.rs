@@ -441,10 +441,7 @@ impl Default for SearchLimits {
 
 /// Used for computing the increment share spent by both clock allocators.
 ///
-/// The share is three quarters of the increment, computed as
-/// `increment * 3 / 4` in integer math with a saturating multiplication so
-/// hostile protocol values bound the result instead of overflowing. Retuned
-/// on 2026-07-24 from the previous `increment / 2` coefficient.
+/// Alternative configuration retained for controlled evaluation.
 ///
 /// # Arguments
 ///
@@ -459,12 +456,7 @@ const fn increment_share_millis(increment_millis: u64) -> u64 {
 
 /// Used for computing the normal per-move target from a remaining game clock.
 ///
-/// The allocator spends one planning-horizon share plus three quarters of the
-/// increment (`inc * 3 / 4` in saturating integer math, retuned 2026-07-24
-/// from `inc / 2` toward the 0.75..1.0 range used by reference allocators),
-/// while retaining [`CLOCK_RESERVE_MILLIS`] whenever the remaining clock
-/// permits. Zero `moves_to_go` means one move rather than division by zero.
-/// Arithmetic saturates for hostile protocol values.
+/// Alternative configuration retained for controlled evaluation.
 ///
 /// # Arguments
 ///
@@ -563,4 +555,3 @@ pub fn clock_budgets(
     let hard = clock_hard_budget_millis(remaining_millis, increment_millis, moves_to_go);
     (Duration::from_millis(soft), Duration::from_millis(hard))
 }
-

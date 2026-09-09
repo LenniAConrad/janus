@@ -1527,4 +1527,3 @@ impl Evaluator for JrbtNetwork {
         false
     }
 }
-

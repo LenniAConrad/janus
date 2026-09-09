@@ -48,4 +48,3 @@ pub(crate) fn spawn_scoped_or_run<'scope, 'env, F>(
         Err(_) => task(),
     }
 }
-

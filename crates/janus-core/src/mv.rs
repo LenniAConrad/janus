@@ -219,4 +219,3 @@ impl FromStr for Move {
         Ok(Self::new(from, to, promotion))
     }
 }
-
