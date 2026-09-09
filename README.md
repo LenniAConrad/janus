@@ -1,7 +1,5 @@
-# Janus
-
 <p align="center">
-  <img src="assets/janus-official-logo.svg" alt="Janus logo" width="360">
+  <img src="assets/janus-banner.svg" alt="Janus" width="100%">
 </p>
 
 Janus is a deterministic, dependency-free UCI chess engine written in Rust.
