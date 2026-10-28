@@ -10,7 +10,7 @@ members = [
 version = "2026.9.9"
 edition = "2021"
 rust-version = "1.75"
-authors = ["Lennart A. Conrad <lennart.a.conrad@gmail.com>"]
+authors = ["Lennart A. Conrad"]
 license = "GPL-3.0-only"
 
 [workspace.lints.rust]
